@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A script's lock from `uv lock --script example.py` (`example.py.lock`) is read as a `uv.lock`: `wheelgap example.py.lock` checks what the script installs, offline, with its markers, and `wheelgap diff` compares two of them. A script called `requirements.py` gets its lock read the same way, not as a requirements file. A script lock whose script beside it sets `no-build`, `no-binary`, `no-build-package` or `no-binary-package` in its `[tool.uv]` (or a `uv.toml` or `pyproject.toml` that does, in a folder above a lock with neither beside it) is refused for now, since the lock doesn't record them. `--fix` gives the lines for the script's `# /// script` block and `uv lock --script`, not `pyproject.toml`'s. (#529, thanks [@emirhan8180](https://github.com/emirhan8180))
 - MCP server: a new `explain_install_failure` tool takes the text of a failed pip, uv, Poetry or PDM install log (up to 1 MB) and the Python and platform the install ran on, reads it as `--from-log` does, and checks each package that failed to build as `check_package` does with `explain: true`: its gaps, the rejected wheels and `--suggest`'s way out. The log is treated as untrusted text: the reply and errors repeat no more of it than package names and versions. (#478, thanks [@YVTOMAZ](https://github.com/YVTOMAZ))
 - `--suggest-targets`: quoted values get the same strictness on one line and over several — a control character, an invalid escape or `''` in a single-quoted value now refuses the file either way (a one-line `''` already did). (#515, thanks [@Seyamalam](https://github.com/Seyamalam))
 - Ctrl-C while packages are being looked up on the index (and during `--deps`) exits at once, without waiting for lookups already in flight. (#516, thanks [@Golden007-prog](https://github.com/Golden007-prog))
@@ -33,7 +34,6 @@
 - `--explain` no longer turns GitHub pages such as sponsors and organization projects into issue tracker links. (#457, thanks [@Vietpr](https://github.com/Vietpr))
 - MCP tools keep their `notes` when `FORCE_COLOR` is set: the CLI now always runs with `--color=never`, so a dimmed note's ANSI prefix no longer hides the `wheelgap: note:` marker and gets the note dropped. (#456, thanks [@P-r-e-m-i-u-m](https://github.com/P-r-e-m-i-u-m))
 - `--dist` with `offline = true` in `[tool.wheelgap]` now names the real way out — set `offline = false` in `[tool.wheelgap]` (or drop the key) — instead of telling you to pass `--online`, which `--dist` refuses. (#452, thanks [@Seyamalam](https://github.com/Seyamalam))
-- `*.py.lock` files are now read as `uv`
 
 ## 0.13.0 (2026-11-16)
 
