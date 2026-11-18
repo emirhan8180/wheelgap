@@ -23,7 +23,7 @@ import itertools
 import urllib.error
 from collections import deque
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from urllib.parse import quote
 
@@ -33,6 +33,7 @@ from packaging.utils import NormalizedName, canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 from . import cache, pypi
+from ._download_pool import DownloadPool
 from .check import SDIST_SUFFIXES, marker_holds, marker_value, rejection
 from .sources import Package, Source, SourceError
 from .targets import Target
@@ -77,7 +78,7 @@ class Resolver:
         self.policy: Callable[[str], tuple[bool, bool]] | None = None
         self._metadata: dict[str, list[str] | Exception] = {}  # a wheel's .metadata URL -> its Requires-Dist
         self.prefetch = prefetch
-        self._pool: ThreadPoolExecutor | None = None
+        self._pool: DownloadPool | None = None
         self._project_jobs: dict[str, Future] = {}
         self._metadata_jobs: dict[str, Future] = {}
         self._release_jobs: dict[tuple[str, str], Future] = {}
@@ -365,21 +366,21 @@ class Resolver:
             return self._resolve(roots, target, constraints)
         # Plans are made under self.policy, which the caller may change between resolves (another source).
         self._planned.clear()
-        pool = ThreadPoolExecutor(max_workers=PREFETCH_WORKERS)
+        pool = DownloadPool(PREFETCH_WORKERS)
         self._pool = pool
         try:
             tree = self._resolve(roots, target, constraints)
         except BaseException:
             # Ctrl-C or an error: don't wait for lookups nobody will read, and don't keep cancelled or unfinished
             # ones, so a reused Resolver looks them up again instead of reporting a CancelledError as a failure.
-            pool.shutdown(wait=False, cancel_futures=True)
+            pool.close(wait=False)
             _drop_unfinished(self._project_jobs)
             _drop_unfinished(self._metadata_jobs)
             _drop_unfinished(self._release_jobs)
             raise
         finally:
             self._pool = None
-        pool.shutdown()
+        pool.close()
         return tree
 
     def _resolve(

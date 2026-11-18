@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
-from conftest import FAKE_INDEX
+from conftest import FAKE_INDEX, FIXTURES
 from test_deps import INDEX, LINUX, WIN_AMD, WIN_ARM, index, release  # noqa: F401  (index: --deps' fake PyPI)
 from test_dist import LINUX_WHEEL, SDIST, WIN_ARM_WHEEL, dist
 
@@ -102,6 +102,7 @@ def test_tools_list_has_valid_schemas():
         "check_dockerfile",
         "check_dist",
         "diff_lockfiles",
+        "explain_install_failure",
         "suggest_targets",
         "list_targets",
     }
@@ -2104,6 +2105,209 @@ def test_diff_lockfiles_errors(fake_pypi, tmp_path, arguments, message):
     assert reply["result"]["isError"] is True
     assert message in reply["result"]["content"][0]["text"]
     assert not fake_pypi
+
+
+def install_log(name: str) -> str:
+    return (FIXTURES / name).read_text(encoding="utf-8")  # universal newlines: a Windows checkout may have CRLF
+
+
+def explain_failure(**arguments: object) -> dict:
+    (_, reply) = run(init(), call("explain_install_failure", **arguments))
+    return reply["result"]
+
+
+def test_explain_install_failure_uv_log(fake_pypi):
+    result = explain_failure(log=install_log("uv-ansi.log"), python="3.13", targets=["win-arm64"])
+    assert result["isError"] is False
+    data = result["structuredContent"]
+    # One shape whatever the count: the package's own keys never land at the top level.
+    assert set(data) == {"targets", "ok", "packages", "assumes", "notes"}
+    assert (data["targets"], data["ok"], data["notes"]) == (["3.13 win-arm64"], False, [])
+    assert data["assumes"] == {"glibc": "2.36", "musl": "1.2", "macos": "14.0"}
+    (pkg,) = data["packages"]
+    assert (pkg["name"], pkg["version"]) == ("nowheels", "0.9")
+    assert pkg["results"] == {"3.13 win-arm64": "source"}
+    assert (pkg["ok"], pkg["gaps"]) == (False, ["3.13 win-arm64"])
+    assert (pkg["rejected"], pkg["rejected_omitted"]) == ({"3.13 win-arm64": []}, {})  # an sdist only
+    assert (pkg["suggest"], pkg["last_with_wheel"]) == ({}, {})  # no other release
+    assert sorted(fake_pypi) == ["https://pypi.org/pypi/nowheels/0.9/json", "https://pypi.org/pypi/nowheels/json"]
+
+
+def test_explain_install_failure_pip_log_with_two_failures(fake_pypi):
+    result = explain_failure(log=install_log("pip24-two-failed.log"), python="3.13", targets=["win-amd64"])
+    data = result["structuredContent"]
+    assert (data["targets"], data["ok"], data["notes"]) == (["3.13 win-amd64"], False, [])
+    fastlib, laggard = data["packages"]  # in the order the log names them
+    # fastlib's version is from the `Downloading` line after an unpinned `Collecting`.
+    assert (fastlib["name"], fastlib["version"]) == ("fastlib", "2.0.0")
+    assert fastlib["results"] == {"3.13 win-amd64": "source"}
+    assert (fastlib["ok"], fastlib["gaps"]) == (False, ["3.13 win-amd64"])
+    assert [w["file"] for w in fastlib["rejected"]["3.13 win-amd64"]] == [
+        "fastlib-2.0.0-cp313-cp313-manylinux_2_17_x86_64.whl"
+    ]
+    assert (fastlib["suggest"], fastlib["last_with_wheel"]) == ({}, {})
+    assert (laggard["name"], laggard["version"]) == ("laggard", "1.0")
+    assert laggard["results"] == {"3.13 win-amd64": "source"}
+    assert (laggard["ok"], laggard["gaps"]) == (False, ["3.13 win-amd64"])
+    assert laggard["rejected"] == {"3.13 win-amd64": []}
+    assert (laggard["suggest"], laggard["last_with_wheel"]) == ({"3.13 win-amd64": "1.1"}, {})
+    # One lookup per package, and one batch of release lists for --suggest's way out.
+    assert sorted(fake_pypi) == [
+        "https://pypi.org/pypi/fastlib/2.0.0/json",
+        "https://pypi.org/pypi/fastlib/json",
+        "https://pypi.org/pypi/laggard/1.0/json",
+        "https://pypi.org/pypi/laggard/json",
+    ]
+
+
+def test_explain_install_failure_suggestions_are_one_lookup(fake_pypi, monkeypatch):
+    batches = []
+    real = mcp.release_suggest.look_up_all
+
+    def counted(wanted):
+        batches.append(sorted(wanted))
+        return real(wanted)
+
+    monkeypatch.setattr(mcp.release_suggest, "look_up_all", counted)
+    explain_failure(log=install_log("pip24-two-failed.log"), python="3.13", targets=["win-amd64"])
+    assert batches == [["fastlib", "laggard"]]
+
+
+def test_explain_install_failure_notes_where_the_log_likely_comes_from(fake_pypi):
+    # fastlib has a wheel for linux-x86_64, so the install that failed to build it didn't run there.
+    result = explain_failure(
+        log=install_log("pip24-two-failed.log"), python="3.13", targets=["linux-x86_64"], glibc="2.28"
+    )
+    data = result["structuredContent"]
+    assert data["assumes"]["glibc"] == "2.28"
+    assert {p["name"]: p["results"] for p in data["packages"]} == {
+        "fastlib": {"3.13 linux-x86_64": "wheel"},
+        "laggard": {"3.13 linux-x86_64": "source"},
+    }
+    assert data["ok"] is False  # laggard still builds from source
+    assert data["notes"] == [
+        "the install log says fastlib failed to build, but fastlib 2.0.0 has a wheel for 3.13 linux-x86_64: the log "
+        "likely comes from another platform or Python than the one checked (python, targets)"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "assumed"),
+    [
+        ({}, "the server's Python and the default platforms"),
+        ({"python": "3.13"}, "the default platforms"),
+        ({"targets": ["win-arm64"]}, "the server's Python"),
+    ],
+)
+def test_explain_install_failure_says_what_it_assumed(fake_pypi, arguments, assumed):
+    data = explain_failure(log=install_log("uv-ansi.log"), **arguments)["structuredContent"]
+    assert data["notes"][0] == (
+        f"the log doesn't say which Python and platform the install ran on, so this checked {assumed}: pass python "
+        "and targets for the machine the install ran on"
+    )
+    if "targets" not in arguments:
+        assert len(data["targets"]) == 4  # the default platforms
+
+
+def test_explain_install_failure_log_with_no_failure_is_an_error(fake_pypi):
+    result = explain_failure(log=install_log("pip-succeeded.log"), python="3.13", targets=["win-amd64"])
+    assert result["isError"] is True
+    assert result["content"][0]["text"] == mcp._LOG_ERRORS[mcp.NO_FAILURE]
+    assert "found no package that failed to build in the log" in result["content"][0]["text"]
+    assert fake_pypi == []
+
+
+def test_explain_install_failure_refusal_gives_the_tools_advice(fake_pypi):
+    result = explain_failure(log=install_log("pip-no-version.log"), python="3.13", targets=["win-amd64"])
+    assert result["isError"] is True
+    text = result["content"][0]["text"]
+    assert text.startswith("the log doesn't say which version of nowheels failed to build")
+    assert "(call check_package for nowheels with the version)" in text
+    assert "--from-log" not in text and "==VERSION" not in text
+    assert fake_pypi == []
+
+
+@pytest.mark.parametrize(
+    "log",
+    [
+        "x" * (1024 * 1024 + 1),
+        "é" * (512 * 1024 + 1),  # measured in UTF-8 bytes, not characters
+        "\ud800" * (350 * 1024),  # a lone surrogate counts too, rather than failing to encode
+    ],
+)
+def test_explain_install_failure_oversize_log_is_an_error(fake_pypi, log):
+    result = explain_failure(log=log, python="3.13", targets=["win-amd64"])
+    assert result["isError"] is True
+    assert "over the 1 MB (1048576 bytes) limit" in result["content"][0]["text"]
+    assert fake_pypi == []
+
+
+def test_explain_install_failure_lone_surrogate_within_the_limit_is_read(fake_pypi):
+    data = explain_failure(log="\ud800\n" + install_log("uv-ansi.log"), python="3.13", targets=["win-arm64"])
+    assert [p["name"] for p in data["structuredContent"]["packages"]] == ["nowheels"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({}, "'log' is required"),
+        ({"log": ""}, "'log' must be a non-empty string"),
+        ({"log": "  \n"}, "'log' must be a non-empty string"),
+        ({"log": 1}, "'log' must be a non-empty string"),
+        ({"log": "x", "platforms": ["win-amd64"]}, "unknown argument(s): platforms"),
+        ({"log": "x", "targets": ["linux-aarch46"]}, "linux-aarch46"),
+        ({"log": "x", "python": "three"}, "can't read Python version"),
+    ],
+)
+def test_explain_install_failure_rejects_invalid_arguments(fake_pypi, arguments, message):
+    result = explain_failure(**arguments)
+    assert result["isError"] is True
+    assert message in result["content"][0]["text"]
+    assert fake_pypi == []
+
+
+SENTINEL = "SENTINEL-c0ffee"
+
+
+@pytest.mark.parametrize(
+    ("name", "before", "after", "kind"),
+    [
+        (
+            "pip23-laggard.log",
+            "",
+            f"Looking in indexes: https://pypi.org/simple, https://{SENTINEL}.example/simple\n",
+            mcp.OTHER_INDEX,
+        ),
+        ("pip23-laggard.log", "", f"Looking in links: /wheels/{SENTINEL}\n", mcp.FIND_LINKS),
+        ("pdm-verbose.log", "https://pypi.org/simple/pyaudio/", f"https://{SENTINEL}.example/simple/pyaudio/", None),
+    ],
+)
+def test_explain_install_failure_never_echoes_the_logs_index(fake_pypi, name, before, after, kind):
+    # --from-log's message quotes the log's `Looking in indexes:` / `Looking in links:` URLs (and PDM's build link):
+    # the tool says it in its own words, pointing to what an agent can do.
+    text = install_log(name)
+    log = text.replace(before, after) if before else after + text
+    assert SENTINEL in log
+    result = explain_failure(log=log, python="3.13", targets=["win-amd64"])
+    assert result["isError"] is True
+    message = result["content"][0]["text"]
+    assert SENTINEL not in message
+    assert message == mcp._LOG_ERRORS[kind or mcp.OTHER_INDEX]
+    assert "WHEELGAP_INDEX_URL" in message and "check_package" in message
+    assert "--index-url" not in message
+    assert fake_pypi == []
+
+
+def test_explain_install_failure_log_from_another_index_is_checked_there(fake_pypi, monkeypatch):
+    monkeypatch.setenv("WHEELGAP_INDEX_URL", "https://mirror.example.com/pypi")
+    log = f"Looking in indexes: https://{SENTINEL}.example/simple\n" + install_log("pip23-laggard.log")
+    result = explain_failure(log=log, python="3.13", targets=["win-amd64"])
+    assert result["isError"] is False
+    (pkg,) = result["structuredContent"]["packages"]
+    assert (pkg["name"], pkg["version"], pkg["results"]) == ("laggard", "1.0", {"3.13 win-amd64": "source"})
+    assert "suggest" not in pkg  # another index may hold private names: nothing is looked up, as --suggest
+    assert SENTINEL not in json.dumps(result)
+    assert fake_pypi and all(url.startswith("https://mirror.example.com/pypi/") for url in fake_pypi)
 
 
 def test_mcp_docs_name_every_tool():

@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 import zlib
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import replace
@@ -42,6 +42,7 @@ from packaging.utils import (
 from packaging.version import InvalidVersion, Version
 
 from . import __version__, cache
+from ._download_pool import DownloadPool
 from .sources import Package, SourceError
 
 DEFAULT_INDEX = "https://pypi.org/pypi"
@@ -1218,14 +1219,21 @@ def fill_all(
     ]
     report = _progress.get()
     if todo:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            if report is None:
-                list(pool.map(fn, todo))
-            else:
+        pool = DownloadPool(workers)
+        interrupted = False
+        try:
+            if report is not None:
                 report(0, len(todo))
-                for done, future in enumerate(as_completed([pool.submit(fn, p) for p in todo]), 1):
-                    future.result()
+            futures = [pool.submit(fn, p) for p in todo]
+            for done, future in enumerate(futures if report is None else as_completed(futures), 1):
+                future.result()
+                if report is not None:
                     report(done, len(todo))
+        except KeyboardInterrupt:
+            interrupted = True
+            raise
+        finally:
+            pool.close(wait=not interrupted)
     for p in todo:
         if p.partial_files and p.error:
             p.files = None  # never judged on the lock's partial files, not even by --explain

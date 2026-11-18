@@ -86,6 +86,23 @@ _PDM_INSTALL = re.compile(rf"  ✖ Install ({_NAME}) (\S+) failed\s*$")
 _PDM_ERROR = re.compile(rf"(?:add ({_NAME}) failed:|pdm\.termui: Error occurs adding ({_NAME}):)\s*$")
 _PDM_SOURCE = re.compile(r"pdm\.termui: Running PEP 517 backend to build a wheel for <Link (\S+) \(from (\S+)\)>\s*$")
 
+
+class LogError(SourceError):
+    """A refusal a caller may want to word itself, without repeating the log's text: `kind` is OTHER_INDEX (the log
+    used another index than PyPI: its `Looking in indexes:` line, or PDM's build link), FIND_LINKS (its `Looking in
+    links:` line) or NO_FAILURE (it names no package that failed to build). The message is --from-log's, and the
+    first two quote the log's URLs. Every other refusal is a plain SourceError that names at most a package and a
+    version from the log."""
+
+    def __init__(self, message: str, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+OTHER_INDEX = "other_index"
+FIND_LINKS = "find_links"
+NO_FAILURE = "no_failure"
+
 _UNCLEAR = "unclear"  # the log collects the package again without a version after naming one
 _DIRECT = "direct"  # the log installs the package from a URL or a path, not from an index
 _EARLIER = "earlier"  # the package's last `Collecting` line is from an earlier pip run in the log
@@ -276,10 +293,11 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
             error_key = canonicalize_name(pdm_error)
             if pdm_sources.get(error_key) != {Version(version)}:
                 if error_key in pdm_other_sources:
-                    raise SourceError(
+                    raise LogError(
                         f"--from-log: PDM built {pdm_error} from another index than PyPI "
                         f"({_USERINFO.sub('//', pdm_other_sources[error_key])}), so it may not be PyPI's; pass that "
-                        "index with --index-url to check it"
+                        "index with --index-url to check it",
+                        OTHER_INDEX,
                     )
                 if pdm_verbose:
                     raise SourceError(
@@ -308,15 +326,17 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
             others = [url for url in map(str.strip, m.group(1).split(",")) if url.rstrip("/") != _PYPI_SIMPLE]
             if others and not other_index:
                 others = [_USERINFO.sub("//", url) for url in others]
-                raise SourceError(
+                raise LogError(
                     f"--from-log: the log used another index than PyPI ({', '.join(others)}), so its packages may "
-                    "not be PyPI's; pass that index with --index-url to check it"
+                    "not be PyPI's; pass that index with --index-url to check it",
+                    OTHER_INDEX,
                 )
         if (m := _LINKS.match(line)) and not other_index:
             links = ", ".join(_USERINFO.sub("//", url.strip()) for url in m.group(1).split(","))
-            raise SourceError(
+            raise LogError(
                 f"--from-log: the log used --find-links ({links}), so its packages may not be PyPI's; pass the "
-                "index they came from with --index-url to check it"
+                "index they came from with --index-url to check it",
+                FIND_LINKS,
             )
         if _INSTALLED.match(line):
             # A later run's failure without its own `Collecting` line must not take this run's version.
@@ -360,9 +380,10 @@ def failed_builds(text: str, other_index: bool = False) -> list[tuple[str, str]]
         raise SourceError("--from-log: PDM's install failure is not a clear build failure; refusing to guess")
 
     if not failures:
-        raise SourceError(
+        raise LogError(
             "--from-log: found no package that failed to build (pip's `Failed to build NAME` or uv's "
-            "``Failed to build `NAME==VERSION` ``, or a supported Poetry/PDM build diagnostic)"
+            "``Failed to build `NAME==VERSION` ``, or a supported Poetry/PDM build diagnostic)",
+            NO_FAILURE,
         )
     return list(failures.values())
 

@@ -3,6 +3,8 @@ metadata. A fake JSON API serves each project page and each release page with it
 
 import json
 import re
+import subprocess
+import sys
 import urllib.error
 from collections import Counter
 from threading import Barrier
@@ -252,6 +254,57 @@ def test_prefetch_stops_before_the_package_limit(index, monkeypatch):
         return Counter(index)
 
     assert run(True) == run(False)
+
+
+@pytest.mark.parametrize("operation", ["resolve", "fill"])
+def test_interrupted_lookup_does_not_hold_the_process_open(operation):
+    result = subprocess.run(  # check interpreter shutdown, not just when resolve() returns
+        [
+            sys.executable,
+            "-c",
+            """
+from threading import Event
+import sys
+from wheelgap import deps, pypi
+from wheelgap.sources import Package
+
+started = Event()
+
+def block(*args, **kwargs):
+    started.set()
+    Event().wait()
+
+def interrupt(*args):
+    assert started.wait(3), 'worker did not start'
+    raise KeyboardInterrupt
+
+operation = sys.argv[1]
+try:
+    if operation == 'resolve':
+        resolver = deps.Resolver()
+        def resolve(*args):
+            resolver._pool.submit(block)
+            interrupt()
+        resolver._resolve = resolve
+        resolver.resolve([], None)
+    else:
+        pypi.fill = block
+        def completed(futures):
+            # Interrupt the wait without sending a platform-dependent signal.
+            interrupt()
+        pypi.as_completed = completed
+        with pypi.reporting_progress(lambda done, total: None):
+            pypi.fill_all([Package('blocked', '1.0')])
+except KeyboardInterrupt:
+    sys.exit(130)
+""",
+            operation,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,  # only a hang takes this long: startup on a busy Windows or macOS runner can take seconds
+    )
+    assert result.returncode == 130, result.stderr
 
 
 def test_cli_checks_what_the_names_install(index, capsys):

@@ -624,6 +624,7 @@ FLOWS = [
     ('["a" b]', None),
     ("[- a]", None),
     ('["a\\tb"]', None),  # an escape
+    ('["a\x07"]', None),  # a control character in a quoted item
     ("['it''s']", None),
     ("[a", None),
     ("['a]", None),
@@ -693,6 +694,9 @@ def test_flow_matches_pyyaml(text, expected):
         ("`x", "refused"),
         ("'it''s'", "refused"),
         ("'a'b", "refused"),
+        ("'a\x07'", "refused"),  # a control character, as a multi-line quote's are
+        ('"a\x07"', "refused"),
+        ('"a\\qb"', "refused"),  # an escape _quoted_end would reject over two lines
         ("'a'#c", "refused"),  # `#` straight after a quote isn't a comment
         ("[a]x", "refused"),
         ("[a]#c", "refused"),
@@ -721,6 +725,7 @@ def test_value(text, expected):
         ("*anchor", "an alias"),
         ('"a\\tb"', "a quoted value with escapes"),
         ('"a\\"b" # c', "a quoted value with escapes"),
+        ('"a\\\tb"', "a quoted value with escapes"),  # `\` then a tab is a valid YAML 1.2 escape
     ],
 )
 def test_values_that_are_never_read(text, kind):
@@ -739,6 +744,7 @@ def test_values_that_are_never_read(text, kind):
         ("a:b", None),
         ("a b: c", None),
         ('"arch\\x69tecture": x86', None),  # escapes in a quoted key
+        ("'a\x07': x", None),  # a control character in a quoted key
         ("'it''s': x", None),
         ("<<: *defaults", None),
         ("? key", None),
@@ -1598,7 +1604,8 @@ jobs:
     [
         # Quoted continuations are opaque; their contents are never interpreted as keys or comments.
         ('  A: "x \\" # not a comment\n    y"\n', None),
-        ("  B: 'it''s # not a comment\n    either'\n", None),
+        # `''` is an escape: it refuses on one line, so it refuses over two as well (#352).
+        ("  B: 'it''s # not a comment\n    either'\n", (2, "B: 'it''s # not a comment")),
         ("  C: 'one\n    two'\n", None),
         # A plain value goes on over more-indented lines: those are text, never keys.
         ('  D: echo building\n    "quoted\n    runs-on: windows-latest\n', (4, "runs-on: windows-latest")),

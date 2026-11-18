@@ -1,8 +1,9 @@
 # Set up wheelgap-mcp in your agent
 
 `wheelgap-mcp` is wheelgap's [MCP](https://modelcontextprotocol.io/) server. It
-runs over stdio and gives an agent seven read-only tools: `check_package`,
-`check_lockfile`, `check_dockerfile`, `check_dist`, `diff_lockfiles`, `suggest_targets` and `list_targets`. Every
+runs over stdio and gives an agent eight read-only tools: `check_package`,
+`check_lockfile`, `check_dockerfile`, `check_dist`, `diff_lockfiles`, `explain_install_failure`,
+`suggest_targets` and `list_targets`. Every
 client below starts it with the same command:
 
 ```bash
@@ -19,7 +20,7 @@ too.
 
 ## Tools
 
-All seven are read-only. Package checks look packages up on PyPI, or on the index in
+All eight are read-only. Package checks look packages up on PyPI, or on the index in
 `WHEELGAP_INDEX_URL`; `list_targets` and `suggest_targets` contact nothing. Like wheelgap the server needs nothing beyond
 `packaging`.
 
@@ -30,8 +31,8 @@ All seven are read-only. Package checks look packages up on PyPI, or on the inde
   settings included: the packages with gaps, the ones it skipped (git, path and
   private-index packages, which aren't checked) and any notes. It also returns
   `blocking_newer_python` when two Pythons, one newer, are checked. With
-  `dependencies: true`, requirements files, `pyproject.toml` and a script's
-  `# /// script` block are resolved as `--deps` would, including transitive gaps, each with `via`
+  `dependencies: true`, requirements files, a conda `environment.yml`,
+  `pyproject.toml` and a script's `# /// script` block are resolved as `--deps` would, including transitive gaps, each with `via`
   (the path to it on each gap target) and `direct` (the direct dependencies
   behind it). It's refused where `--deps` is: lockfiles, offline, and another
   index.
@@ -62,6 +63,32 @@ All seven are read-only. Package checks look packages up on PyPI, or on the inde
   agent that bumps dependencies can save the old lockfile under its own name
   (`mkdir -p /tmp/old && git show HEAD:uv.lock > /tmp/old/uv.lock`) and ask
   whether the upgrade lost a wheel.
+- `explain_install_failure`: takes the text of a failed install log (up to 1 MB)
+  and reads it as [`--from-log`](cli.md#from-log) does: pip's `Failed to build` summary
+  (its versions from the `Collecting`, `Downloading` and `Using cached` lines),
+  uv's ``Failed to build `NAME==VERSION` ``, Poetry's build-backend note (normal
+  or `-v` output) and `pdm install -v` output. PDM's normal output is refused,
+  since it doesn't say which index a package came from; colour codes and GitHub
+  Actions timestamps are fine. Each package that failed to build (at most 50)
+  is checked at the version the log names, as `check_package` does with
+  `explain: true`. Pass `python` and `targets` for the machine the install ran
+  on: the log doesn't say, so without them the server's Python and the default
+  platforms are checked, and `notes` says so. The reply is always
+  `{"targets": [...], "ok": ..., "packages": [...], "assumes": {...}, "notes": [...]}`:
+  `packages` has one entry per failed package, in the order the log names them,
+  in `check_package`'s shape (`name`, `version`, `results`, `gaps`, `ok`,
+  `rejected`, `rejected_omitted`, `via`, `direct`, `issues_url`, and `suggest`
+  and `last_with_wheel` when they were looked up, in one lookup for all of
+  them); `ok` is true only if every one installs without building on every
+  target. A failed package with a wheel for a checked target gets a note that
+  the log likely comes from another platform or Python. A log it can't read
+  with certainty is a tool error, never a guess: one that names no failed build,
+  one where which version failed isn't clear, or one that installed from another
+  index than PyPI (pip's `Looking in indexes:`, PDM's build link) or with
+  `--find-links`, unless the server's `WHEELGAP_INDEX_URL` is set (then the
+  failures are checked on that index). uv's log doesn't name its index, so a uv failure is checked on PyPI (or
+  `WHEELGAP_INDEX_URL`). The log is untrusted text: the reply and errors repeat
+  no more of it than package names and versions.
 - `suggest_targets`: read the project's GitHub Actions workflows, `.gitlab-ci.yml` and Dockerfiles,
   returning `targets`, `python`, `unreadable` and suggested `config`, as
   `wheelgap --suggest-targets --json` does. Each finding names its file and line.
@@ -135,7 +162,7 @@ for `check_dist` the nearest folder above the dist folder with a
 | `macos` | string | `[tool.wheelgap] macos`, else `14.0` | Oldest macOS version to support. |
 | `pyodide_lock` | string | `[tool.wheelgap] pyodide-lock` (when a pyodide target is checked) | Absolute path or https URL of a Pyodide release's `pyodide-lock.json`. |
 | `offline` | boolean | `[tool.wheelgap] offline`, else `false` | Use only the files recorded in the lockfile; never contact the index. `true` turns it on; `offline = true` in the project can't be turned off from here. |
-| `dependencies` | boolean | `false` | Resolve transitive dependencies of requirements files, `pyproject.toml` and a script's `# /// script` block with `--deps`; each gap gets `via` and `direct`. Refused for lockfiles, offline and another index. |
+| `dependencies` | boolean | `false` | Resolve transitive dependencies of requirements files, a conda `environment.yml`, `pyproject.toml` and a script's `# /// script` block with `--deps`; each gap gets `via` and `direct`. Refused for lockfiles, offline and another index. |
 
 #### `check_dockerfile`
 
@@ -165,6 +192,17 @@ for `check_dist` the nearest folder above the dist folder with a
 | `new` | string | required | Absolute path to the lockfile (or project directory) after the change. |
 | `python` | string | the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. |
 | `targets` | array of strings | the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. `list_targets` gives every name. |
+
+#### `explain_install_failure`
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `log` | string | required | The text of the failed pip, uv, Poetry or PDM (`pdm install -v`) install log, up to 1 MB in UTF-8. |
+| `python` | string | the server's | Target Python version(s), comma-separated, e.g. '3.13' or '3.12,3.14t' (t = free-threaded); 'next' and 'next-t' mean the newest CPython wheelgap knows. Pass the one the install ran with: the log doesn't say. |
+| `targets` | array of strings | the four default platforms | Platforms, e.g. ['linux-aarch64', 'musl-x86_64', 'win-arm64', 'pyodide'], Docker platforms such as 'linux/arm64', or the groups 'all', 'everything' and 'mobile'. Pass the platform the install ran on: the log doesn't say. `list_targets` gives every name. |
+| `glibc` | string | `2.36` | glibc version for `linux-*` targets, e.g. '2.28' for a RHEL 8 image. |
+| `musl` | string | `1.2` | musl version for `musl-*` (Alpine) targets. |
+| `macos` | string | `14.0` | Oldest macOS version to support. |
 
 #### `suggest_targets`
 

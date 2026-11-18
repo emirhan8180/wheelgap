@@ -8,7 +8,15 @@ import pytest
 from conftest import FIXTURES
 
 from wheelgap.cli import main
-from wheelgap.install_log import MAX_LOG_BYTES, failed_builds, read_log
+from wheelgap.install_log import (
+    FIND_LINKS,
+    MAX_LOG_BYTES,
+    NO_FAILURE,
+    OTHER_INDEX,
+    LogError,
+    failed_builds,
+    read_log,
+)
 from wheelgap.sources import SourceError
 
 
@@ -150,6 +158,7 @@ def test_pdm_other_source_is_refused(source, named):
     text = log("pdm-verbose.log").replace("https://pypi.org/simple/pyaudio/", source)
     with pytest.raises(SourceError) as e:
         failed_builds(text)
+    assert isinstance(e.value, LogError) and e.value.kind == OTHER_INDEX
     message = str(e.value)
     assert f"another index than PyPI ({named})" in message
     assert "--index-url" in message
@@ -363,6 +372,22 @@ def test_find_links_is_refused(links):
         failed_builds(links + log("pip23-laggard.log"))
     assert "alice" not in str(e.value)
     assert failed_builds(links + log("pip23-laggard.log"), other_index=True) == [("laggard", "1.0")]
+
+
+@pytest.mark.parametrize(
+    "name,prefix,kind",
+    [
+        ("pip23-laggard.log", INDEXES, OTHER_INDEX),
+        ("pip23-laggard.log", "Looking in links: /wheels\n", FIND_LINKS),
+        ("pip-succeeded.log", "", NO_FAILURE),
+    ],
+)
+def test_refusals_a_caller_may_word_itself_have_a_kind(name, prefix, kind):
+    # The MCP tool writes its own message for these, since the first two quote the log's URLs.
+    with pytest.raises(LogError) as e:
+        failed_builds(prefix + log(name))
+    assert e.value.kind == kind
+    assert isinstance(e.value, SourceError)  # the command line reports it as before
 
 
 def test_uv_lines_count_only_after_uvs_prefixes():
