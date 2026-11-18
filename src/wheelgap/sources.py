@@ -2463,10 +2463,10 @@ def file_kind(path: Path) -> str:
         return PARSERS[name]
     if name.startswith("pylock.") and name.endswith(".toml"):
         return "pylock"
+    if name.endswith(".lock") and "uv" in name or name.endswith(".py.lock"):
+        return "uv"
     if name.startswith("requirements") and name.endswith(".lock"):
         return "requirements"
-    if name.endswith(".lock") and "uv" in name:
-        return "uv"
     if name.endswith((".txt", ".in")):
         return "requirements"
     if name.endswith(".json"):

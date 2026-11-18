@@ -44,7 +44,7 @@ A **file** is read by its name:
 
 | file name | read as |
 | --- | --- |
-| `uv.lock`, or another `*.lock` name containing `uv` | `uv.lock` |
+| `uv.lock`, `*.py.lock`, or another `*.lock` name containing `uv` | `uv.lock` |
 | `pylock.toml`, `pylock.*.toml` | `pylock.toml` |
 | `poetry.lock` | `poetry.lock` |
 | `pdm.lock` | `pdm.lock` |

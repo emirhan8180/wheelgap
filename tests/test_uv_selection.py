@@ -11,6 +11,7 @@ from wheelgap.sources import (
     SourceError,
     UvSelection,
     _poetry_extras_declared_elsewhere,
+    file_kind,
     load_inputs,
     select_uv_dependencies,
 )
@@ -1859,3 +1860,7 @@ def test_uv_manifest_requirement_with_two_sources_is_input_error(tmp_path):
     )
     with pytest.raises(SourceError, match="the manifest has a dependency 'example' with conflicting sources"):
         load_inputs([str(tmp_path)])
+
+
+def test_script_lockfile_is_read_as_uv(tmp_path):
+    assert file_kind(tmp_path / "requirements.py.lock") == "uv"

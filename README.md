@@ -53,6 +53,7 @@ wheelgap uv.lock -p 3.12,3.13,3.14 -t linux-x86_64,linux-aarch64
 
 # Check what a single-file script installs (PEP 723)
 wheelgap example.py --deps -t win-arm64
+wheelgap example.py.lock --deps -t win-arm64
 
 # Diagnose failed pip, uv, Poetry or PDM (-v) wheel builds
 wheelgap --from-log pip-install.log -p 3.13 -t win-arm64
@@ -100,13 +101,13 @@ Not sure what to put there? `wheelgap --suggest-targets` reads the platforms you
 
 Each cell in the table is one of:
 
-| cell | meaning |
-| --- | --- |
-| `✓` | a compatible wheel exists, so the install is fast |
-| `● source` | no wheel, only an sdist, so it compiles at install time (needs a compiler, headers, time) |
-| `✗ missing` | no wheel and no sdist, so the install fails |
-| `–` | not installed on this target (environment markers exclude it, or the target selects another resolution) |
-| `✓ bundled` | no wheel on PyPI, but Pyodide ships its own build (with `--pyodide-lock`) |
+| cell        | meaning                                                                                                 |
+| ----------- | ------------------------------------------------------------------------------------------------------- |
+| `✓`         | a compatible wheel exists, so the install is fast                                                       |
+| `● source`  | no wheel, only an sdist, so it compiles at install time (needs a compiler, headers, time)               |
+| `✗ missing` | no wheel and no sdist, so the install fails                                                             |
+| `–`         | not installed on this target (environment markers exclude it, or the target selects another resolution) |
+| `✓ bundled` | no wheel on PyPI, but Pyodide ships its own build (with `--pyodide-lock`)                               |
 
 **Exit codes:** `0` no gaps, `1` gaps found, `2` bad input. `--fail-on missing` accepts source builds, `--ignore NAME` accepts a known gap, and `--exit-zero` never fails on gaps.
 
