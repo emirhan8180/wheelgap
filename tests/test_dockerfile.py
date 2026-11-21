@@ -1545,15 +1545,15 @@ def test_cli_dockerfile_inputs_follows_nested_requirements_and_constraints(tmp_p
         assert str(tmp_path / name) in result.err
 
 
-def test_cli_dockerfile_inputs_has_constraints_and_includes_files(tmp_path, capsys):
+def test_cli_dockerfile_inputs_has_constraints_and_includes_files(tmp_path, capsys, fake_pypi):
     path = _context(
         tmp_path,
         "FROM python:3.13-slim\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt -c constraints.txt\n",
         ("requirements.txt", "constraints.txt", "reqs/base.txt"),
     )
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("-r reqs/base.txt\nidna==3.7", encoding="utf-8")
-    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 1
+    requirements.write_text("-r reqs/base.txt\npurewheel==3.1\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
     result = capsys.readouterr()
     dockerfile_input = json.loads(result.out)["dockerfile_inputs"][0]
     assert dockerfile_input["constraints"] == ["constraints.txt"]
