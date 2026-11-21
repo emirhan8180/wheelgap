@@ -19,7 +19,7 @@
             "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["dockerfile", "line", "file"],
+                "required": ["dockerfile", "line", "file", "constraints", "includes"],
                 "properties": {
                     "dockerfile": {"type": "string", "description": "The --dockerfile path as given."},
                     "line": {
@@ -30,7 +30,17 @@
                     "file": {
                         "type": "string",
                         "description": "The requirements file, relative to the build context, with / separators."
-                    }
+                    },
+		    "constraints": {
+			"type": "array",
+			"description": "Files after -c",
+			"items": {"type": "string"}
+		    },
+		    "includes": {
+			    "type": "array",
+			    "description": "Files after -r",
+			    "items": {"type": "string"}
+		    }
                 }
             }
         },

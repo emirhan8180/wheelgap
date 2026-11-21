@@ -1002,7 +1002,7 @@ def report_json(
     issues_urls: dict[int, str | None] | None = None,
     gap_wheels: list[gapwheels.Fill] | None = None,
     pi_wheels: dict[int, piwheels.Hint] | None = None,
-    dockerfile_inputs: list[dict[str, str | int]] | None = None,
+    dockerfile_inputs: list[dict[str, str | int | list[str]]] | None = None,
     directory_inputs: list[dict[str, object]] | None = None,
 ) -> str:
     multi_py = len({t.python for t in targets}) > 1
@@ -2761,7 +2761,19 @@ def _main(argv: list[str], project: Path | None = None) -> int:
                 # As the Dockerfile's COPY names it: relative to the build context, with /, whatever the OS, the
                 # working directory or the way the context was given.
                 dockerfile_inputs=[
-                    {"dockerfile": args.dockerfile, "line": line, "file": path.relative_to(context_dir).as_posix()}
+                    {
+                        "dockerfile": args.dockerfile,
+                        "line": line,
+                        "file": path.relative_to(context_dir).as_posix(),
+                        "constraints": [
+                            constraint_path.relative_to(context_dir).as_posix()
+                            for constraint_path in docker_constraints[path]
+                        ],
+                        "includes": [
+                            include_path.relative_to(context_dir).as_posix()
+                            for include_path in docker_includes[(line, path)]
+                        ],
+                    }
                     for line, path in installs
                 ]
                 if args.dockerfile_inputs

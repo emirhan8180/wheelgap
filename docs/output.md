@@ -458,9 +458,10 @@ you don't know. Keys are never renamed or removed.
 
 With [`--dockerfile-inputs`](cli.md#dockerfile-inputs) (after 0.13.0), the top-level `dockerfile_inputs` list has one
 entry per requirements file, in the order of `sources`: the `dockerfile` path as it was given, the `line` its `RUN`
-starts on (counted from 1; the first `RUN` that installs the file, if several do), and the `file` path relative to
-the build context, with `/` on every OS (`reqs/base.txt`), as the Dockerfile's `COPY` names it; `sources` gives its
-name only. The key is absent without the flag.
+starts on (counted from 1; the first `RUN` that installs the file, if several do),
+the `file`, the `constraints` files and the `includes` files paths relative to
+the build context, with `/` on every OS (`reqs/base.txt`), as the Dockerfile's
+`COPY` names it; `sources` gives its name only. The key is absent without the flag.
 
 When an input is a directory (after 0.13.0), the top-level `directory_inputs` list says which of its files was read,
 one entry per directory: the `directory` as it was given, the `file` relative to it with `/` on every OS

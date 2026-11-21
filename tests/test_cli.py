@@ -3325,8 +3325,8 @@ def test_dockerfile_input_provenance_in_json_and_annotations(capsys, fake_pypi, 
     _assert_matches_output_schema(report)
     assert report["sources"] == ["requirements.txt", "second.txt"]
     assert report["dockerfile_inputs"] == [
-        {"dockerfile": "Dockerfile", "line": 4, "file": "requirements.txt"},
-        {"dockerfile": "Dockerfile", "line": 5, "file": "second.txt"},
+        {"dockerfile": "Dockerfile", "line": 4, "file": "requirements.txt", "constraints": [], "includes": []},
+        {"dockerfile": "Dockerfile", "line": 5, "file": "second.txt", "constraints": [], "includes": []},
     ]
     assert "::error file=requirements.txt,line=1," in err
     assert "nowheels 0.9 builds from source on linux-x86_64 (installed by Dockerfile:4)." in err
@@ -3361,7 +3361,9 @@ def test_dockerfile_input_provenance_names_the_line_a_continued_run_starts_on(ca
     report = json.loads(out)
     _assert_matches_output_schema(report)
     assert report["sources"] == ["requirements.txt"]
-    assert report["dockerfile_inputs"] == [{"dockerfile": "docker/Dockerfile", "line": 6, "file": "requirements.txt"}]
+    assert report["dockerfile_inputs"] == [
+        {"dockerfile": "docker/Dockerfile", "line": 6, "file": "requirements.txt", "constraints": [], "includes": []}
+    ]
     assert "::error file=requirements.txt,line=1," in err
     assert "nowheels 0.9 builds from source on linux-x86_64 (installed by docker/Dockerfile:6)." in err
 
@@ -3380,7 +3382,9 @@ def test_dockerfile_inputs_file_is_relative_to_the_build_context(capsys, fake_py
         _, out, _ = run(capsys, "--dockerfile", "docker/Dockerfile", "--dockerfile-inputs", "--json", *context)
         report = json.loads(out)
         _assert_matches_output_schema(report)
-        assert report["dockerfile_inputs"] == [{"dockerfile": "docker/Dockerfile", "line": 4, "file": "reqs/base.txt"}]
+        assert report["dockerfile_inputs"] == [
+            {"dockerfile": "docker/Dockerfile", "line": 4, "file": "reqs/base.txt", "constraints": [], "includes": []}
+        ]
 
 
 def test_no_dockerfile_inputs_key_without_the_flag(capsys, fake_pypi, dockerfile_provenance_inputs):
