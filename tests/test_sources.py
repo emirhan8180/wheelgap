@@ -464,10 +464,11 @@ def test_requirements_symlinked_file_missing_include_names_the_path_pip_would_op
     (tmp_path / "real" / "reqs.txt").write_text("-r base.txt\n", encoding="utf-8")
     (tmp_path / "real" / "base.txt").write_text("psycopg2==2.9.11\n", encoding="utf-8")
     _try_symlink(Path("../real/reqs.txt"), tmp_path / "link" / "reqs.txt")
-    with pytest.raises(FileNotFoundError) as caught:
+    with pytest.raises(SourceError, match=r"^reqs\.txt:1: -r base\.txt: file not found$") as caught:
         parse_requirements(tmp_path / "link" / "reqs.txt")
     # The filename, not str(error): that shows the path's repr, with doubled backslashes on Windows.
-    assert Path(caught.value.filename) == tmp_path / "link" / "base.txt"
+    assert isinstance(caught.value.__cause__, FileNotFoundError)
+    assert Path(caught.value.__cause__.filename) == tmp_path / "link" / "base.txt"
 
 
 def test_requirements_file_reached_by_two_names_lists_packages_once(tmp_path):
@@ -2241,6 +2242,235 @@ def test_requirements_binary_format_control(tmp_path, lines, expected):
     assert {name: (pkgs[name].no_binary, pkgs[name].only_binary) for name in expected} == expected
 
 
+@pytest.mark.parametrize(
+    "lines, expected",
+    [
+        # Each row is what pip 26.3 does (pip install --dry-run -r FILE): the option counts for the whole install,
+        # like the same option on a line of its own, wherever the requirement that carries it is.
+        ("fastlib>=2 --no-binary fastlib\n", {"fastlib": (True, False)}),
+        (
+            "fastlib>=2 --no-binary fastlib,purewheel\npurewheel==3.1\n",
+            {"fastlib": (True, False), "purewheel": (True, False)},
+        ),
+        ("purewheel==3.1\nfastlib==2.0.0 --no-binary :all:\n", {"fastlib": (True, False), "purewheel": (True, False)}),
+        (
+            "fastlib==2.0.0 --no-binary purewheel\npurewheel==3.1\n",
+            {"fastlib": (False, False), "purewheel": (True, False)},
+        ),
+        ("fastlib==2.0.0 --only-binary=fastlib\n", {"fastlib": (False, True)}),
+        ("fastlib==2.0.0 --no-binary=fastlib --only-binary=fastlib\n", {"fastlib": (False, True)}),
+        ("--only-binary :all:\nfastlib==2.0.0 --no-binary fastlib\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 ; python_version >= '3.8' --no-binary fastlib\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 --hash=sha256:aa --no-binary fastlib --hash sha256:bb\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 \\\n    --no-binary fastlib\n", {"fastlib": (True, False)}),
+        ("fastlib==2.0.0 --config-settings a=b -C c=d -Ce=f --config-setting=g=h\n", {"fastlib": (False, False)}),
+    ],
+)
+def test_requirements_format_options_after_a_requirement(tmp_path, lines, expected):
+    req = tmp_path / "requirements.txt"
+    req.write_text(lines, encoding="utf-8")
+    source = parse_requirements(req)
+    pkgs = by_name(source)
+    assert {name: (pkgs[name].no_binary, pkgs[name].only_binary) for name in expected} == expected
+    assert all(not p.skip and not p.error for p in source.packages)
+    assert all(" -" not in spec for spec in source.specs)  # --deps resolves the requirement, not its options
+
+
+def test_requirements_options_after_a_requirement_keep_its_pin_and_hash_mode(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib==2.0.0 --no-binary fastlib --hash=sha256:aa\npurewheel>=3 --only-binary purewheel\n")
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.spec) for p in source.packages] == [
+        ("fastlib", "2.0.0", None),
+        ("purewheel", None, ">=3"),
+    ]
+    assert source.compiled and source.specs == ["fastlib==2.0.0", "purewheel>=3"]
+
+
+@pytest.mark.parametrize(
+    "line, ignored",
+    [
+        # Each row is what pip 26.3 does (pip install --dry-run -r FILE): it parses the option and drops it, so the
+        # requirement is installed from the same index as without it, at the same version.
+        ("fastlib==2.0.0 -f https://example.invalid/wheels.html", ["-f"]),
+        ("fastlib==2.0.0 -fhttps://example.invalid/wheels.html", ["-f"]),
+        ("fastlib==2.0.0 --find-links ./wheels", ["--find-links"]),
+        ("fastlib==2.0.0 --find-links=./wheels", ["--find-links"]),
+        ("fastlib==2.0.0 --find ./wheels", ["--find-links"]),  # optparse takes an unambiguous prefix
+        ("fastlib==2.0.0 \\\n    -f ./wheels", ["-f"]),
+        ("fastlib==2.0.0 -i https://example.invalid/simple", ["-i"]),
+        ("fastlib==2.0.0 --index-url=https://example.invalid/simple", ["--index-url"]),
+        ("fastlib==2.0.0 --pypi-url https://example.invalid/simple", ["--pypi-url"]),
+        ("fastlib==2.0.0 --extra-index-url https://example.invalid/simple", ["--extra-index-url"]),
+        ("fastlib==2.0.0 --no-index", ["--no-index"]),
+        ("fastlib==2.0.0 --pre", ["--pre"]),
+        ("fastlib==2.0.0 --prefer-binary", ["--prefer-binary"]),
+        ("fastlib==2.0.0 -r more.txt", ["-r"]),  # never read, so a missing file is no error either
+        ("fastlib==2.0.0 --requirement=more.txt", ["--requirement"]),
+        ("fastlib==2.0.0 -c cons.txt", ["-c"]),
+        ("fastlib==2.0.0 --trusted-host example.invalid", ["--trusted-host"]),
+        ("fastlib==2.0.0 --require-hashes", ["--require-hashes"]),
+        ("fastlib==2.0.0 --no-require-hashes", ["--no-require-hashes"]),
+        ("fastlib==2.0.0 -f -r", ["-f"]),  # -r is -f's value: optparse takes the next word, whatever it is
+        ("fastlib==2.0.0 --hash=sha256:aa stray", ["words that aren't options"]),
+        ("fastlib==2.0.0 - -- -f x", ["words that aren't options"]),
+        ("fastlib==2.0.0 -f x --pre -f y --no-binary :none:", ["-f", "--pre"]),
+        # pip turns the feature on for the run, and no feature changes which file it picks: no note.
+        ("fastlib==2.0.0 --use-feature fast-deps", []),
+    ],
+)
+def test_requirements_options_pip_ignores_after_a_requirement(tmp_path, line, ignored):
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"purewheel==3.1\n{line}\n", encoding="utf-8")
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.skip, p.no_binary, p.only_binary) for p in source.packages] == [
+        ("purewheel", "3.1", None, False, False),
+        ("fastlib", "2.0.0", None, False, False),
+    ]
+    assert source.specs == ["purewheel==3.1", "fastlib==2.0.0"]
+    assert source.ignored_options == [
+        f"requirements.txt:2: pip ignores {option} after a requirement" for option in ignored
+    ]
+
+
+def test_requirements_format_option_is_read_only_where_pip_reads_it(tmp_path):
+    # pip 26.3: `-f --only-binary` makes "--only-binary" -f's value and sets "nowheels" aside, so only fastlib is
+    # binary-only; a -C value that looks like an option is a config setting.
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "fastlib==2.0.0 --only-binary fastlib -f --only-binary nowheels\n"
+        "purewheel==3.1 -C --no-binary=purewheel\nnowheels==0.9\n",
+        encoding="utf-8",
+    )
+    source = parse_requirements(req)
+    assert [(p.name, p.no_binary, p.only_binary) for p in source.packages] == [
+        ("fastlib", False, True),
+        ("purewheel", False, False),
+        ("nowheels", False, False),
+    ]
+
+
+def test_requirements_constraints_after_a_requirement_are_not_read(tmp_path):
+    # pip 26.3 installs the newest release for `fastlib -c cons.txt` and never opens cons.txt.
+    (tmp_path / "cons.txt").write_text("fastlib==1.0\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib -c cons.txt\npurewheel -r more.txt\n", encoding="utf-8")
+    source = parse_requirements(req)
+    assert [(p.name, p.version, p.spec) for p in source.packages] == [
+        ("fastlib", None, None),
+        ("purewheel", None, None),
+    ]
+    assert not source.constraint_specs
+    assert source.ignored_options == [
+        "requirements.txt:1: pip ignores -c after a requirement",
+        "requirements.txt:2: pip ignores -r after a requirement",
+    ]
+
+
+def test_requirements_ignored_option_note_is_once_per_file_and_option(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "base.txt").write_text("purewheel==3.1 -f ./w\nnowheels==0.9 -f ./w --pre\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "fastlib==2.0.0 -f ./w\n-r sub/base.txt\nfastlib==2.0.0 --find-links ./w\n-r sub/base.txt\n", encoding="utf-8"
+    )
+    assert parse_requirements(req).ignored_options == [
+        "requirements.txt:1: pip ignores -f after a requirement",
+        "sub/base.txt:1: pip ignores -f after a requirement",
+        "sub/base.txt:2: pip ignores --pre after a requirement",
+    ]
+
+
+def test_conda_env_pip_list_ignored_option_note(tmp_path):
+    env = tmp_path / "environment.yml"
+    env.write_text("dependencies:\n  - pip:\n    - purewheel==3.1 -f ./wheels\n", encoding="utf-8")
+    source = sources.load_file(env)
+    assert [(p.name, p.version) for p in source.packages] == [("purewheel", "3.1")]
+    assert source.ignored_options == ["environment.yml: pip ignores -f after a requirement"]
+
+
+@pytest.mark.parametrize(
+    "line, message",
+    [
+        # pip 26.3 refuses these ("Invalid requirement: ..." and optparse's own words).
+        ("fastlib>=2 --bogus-option x", "requirements.txt:2: pip refuses this line: no such option: --bogus-option"),
+        ("fastlib>=2 --global-option=x", "requirements.txt:2: pip refuses this line: no such option: --global-option"),
+        ("fastlib>=2 --src x", "requirements.txt:2: pip refuses this line: no such option: --src"),
+        ("fastlib>=2 -x", "requirements.txt:2: pip refuses this line: no such option: -x"),
+        (
+            "fastlib>=2 --no x",
+            "requirements.txt:2: pip refuses this line: ambiguous option: --no (--no-binary, --no-index, "
+            "--no-require-hashes?)",
+        ),
+        (
+            "fastlib>=2 --pr",
+            "requirements.txt:2: pip refuses this line: ambiguous option: --pr (--pre, --prefer-binary?)",
+        ),
+        ("fastlib>=2 --no-binary", "requirements.txt:2: pip refuses this line: --no-binary option requires 1 argument"),
+        ("fastlib>=2 --hash", "requirements.txt:2: pip refuses this line: --hash option requires 1 argument"),
+        ("fastlib>=2 -f", "requirements.txt:2: pip refuses this line: -f option requires 1 argument"),
+        ("fastlib>=2 --trusted-host", "requirements.txt:2: pip refuses this line: --trusted-host option requires 1"),
+        ("fastlib>=2 --pre=yes", "requirements.txt:2: pip refuses this line: --pre option does not take a value"),
+        (
+            "fastlib>=2 --use-feature nope",
+            "requirements.txt:2: pip refuses this line: option --use-feature: invalid choice: 'nope'",
+        ),
+        ("fastlib>=2 --no-binary 'fastlib", "requirements.txt:2: pip can't split this line (an unclosed quote?)"),
+        # pip's parser callbacks refuse these values (pip 26.3 ran).
+        ("fastlib>=2 --no-binary --pre", "requirements.txt:2: pip refuses this line: --no-binary / --only-binary"),
+        ("fastlib>=2 --hash=abc", "requirements.txt:2: pip refuses this line: Arguments to --hash must be a hash"),
+        ("fastlib>=2 --hash=md5:abc", "requirements.txt:2: pip refuses this line: Allowed hash algorithms for --hash"),
+        ("fastlib>=2 -C foo", "requirements.txt:2: pip refuses this line: Arguments to -C must be of the form KEY=VAL"),
+        # pip makes the requirement itself editable, and refuses a name: "fastlib>=2 is not a valid editable
+        # requirement".
+        ("fastlib>=2 -e .", "requirements.txt:2: pip reads -e after a requirement as making that requirement"),
+        (
+            "fastlib>=2 --editable=.",
+            "requirements.txt:2: pip reads --editable after a requirement as making that requirement",
+        ),
+        # pip applies these to the whole install (their parser callbacks change its release settings), and
+        # wheelgap doesn't read them.
+        ("fastlib>=2 --only-final :all:", "requirements.txt:2: pip applies --only-final after a requirement to the"),
+        ("fastlib>=2 --all fastlib", "requirements.txt:2: pip applies --all-releases after a requirement to the"),
+    ],
+)
+def test_requirements_other_options_after_a_requirement_are_refused(tmp_path, line, message):
+    req = tmp_path / "requirements.txt"
+    req.write_text(f"purewheel==3.1\n{line}\n", encoding="utf-8")
+    with pytest.raises(SourceError, match=re.escape(message)):
+        parse_requirements(req)
+
+
+@pytest.mark.parametrize(
+    "top, message",
+    [
+        ("purewheel==3.1\n-r missing.txt\n", "requirements.txt:2: -r missing.txt: file not found"),
+        ("--requirement=missing.txt\n", "requirements.txt:1: --requirement=missing.txt: file not found"),
+        ("# pins\n\n-c missing.txt\npurewheel\n", "requirements.txt:3: -c missing.txt: file not found"),
+        (
+            "purewheel==3.1 \\\n  --hash=sha256:aa\n-r sub/missing.txt\n",
+            "requirements.txt:3: -r sub/missing.txt: file not found",
+        ),
+        ("-r sub/next.txt\n", "sub/next.txt:2: -r gone.txt: file not found"),  # the file that has the line
+        ("-c sub/cons.txt\n", "sub/cons.txt:1: -r gone.txt: file not found"),
+        ("-r sub\n", "requirements.txt:1: -r sub: "),  # a folder: the system's own words (pip: "Is a directory")
+    ],
+)
+def test_requirements_include_that_cannot_be_read_names_the_file_and_line(tmp_path, top, message):
+    # pip stops too ("Could not open requirements file"); before, this was a bare "[Errno 2] No such file ...".
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "next.txt").write_text("purewheel==3.1\n-r gone.txt\n", encoding="utf-8")
+    (tmp_path / "sub" / "cons.txt").write_text("-r gone.txt\n", encoding="utf-8")
+    req = tmp_path / "requirements.txt"
+    req.write_text(top, encoding="utf-8")
+    with pytest.raises(SourceError) as caught:
+        parse_requirements(req)
+    assert str(caught.value).startswith(message) and "Errno" not in str(caught.value)
+    assert isinstance(caught.value.__cause__, OSError)
+    if "file not found" in message:
+        assert str(caught.value) == message
+
+
 def test_requirements_binary_format_control_with_includes(tmp_path):
     (tmp_path / "base.txt").write_text("--no-binary :all:\npurewheel==3.1\n", encoding="utf-8")
     (tmp_path / "override.txt").write_text("--only-binary purewheel\n", encoding="utf-8")
@@ -2360,3 +2590,19 @@ def test_uv_build_policy_rejects_a_tool_key_that_isnt_a_table(tmp_path):
     (tmp_path / "pyproject.toml").write_text('tool = "uv"\n', encoding="utf-8")
     with pytest.raises(SourceError, match=r"\[tool\] must be a table"):
         load_inputs([str(tmp_path)])
+
+
+def test_requirements_option_after_a_requirement_counts_each_time_the_file_is_read(tmp_path):
+    # pip 26.3 reads b.txt twice, so its --no-binary comes after the --only-binary line: pip takes the sdist.
+    (tmp_path / "b.txt").write_text("fastlib==2.0.0 --no-binary fastlib\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("-r b.txt\n--only-binary fastlib\n-r b.txt\n", encoding="utf-8")
+    pkgs = by_name(parse_requirements(tmp_path / "requirements.txt"))
+    assert (pkgs["fastlib"].no_binary, pkgs["fastlib"].only_binary) == (True, False)
+
+
+def test_requirements_tab_before_an_option_is_one_requirement_as_in_pip(tmp_path):
+    # pip splits at single spaces: "fastlib==2.0.0<TAB>--no-binary" is one word, and an invalid requirement.
+    req = tmp_path / "requirements.txt"
+    req.write_text("fastlib==2.0.0\t--no-binary fastlib\n", encoding="utf-8")
+    with pytest.raises(SourceError, match="can't parse requirement"):
+        parse_requirements(req)

@@ -29,7 +29,8 @@ from packaging.utils import (
 )
 from packaging.version import InvalidVersion, Version
 
-from .cutoff import parse_cutoff
+from . import cutoff as cutoffs
+from .cutoff import describe, is_duration, parse_cutoff
 
 if TYPE_CHECKING:
     from .targets import Target
@@ -161,6 +162,9 @@ class DirectoryInput:
     reason: str
     # Files that come first in the search but have nothing to check, each with why.
     empty: list[tuple[Path, str]] = field(default_factory=list)
+    # "pyproject": the root's requirements files under other names, which weren't read, each with whether it looks
+    # like a compiler's full pin list (_looks_compiled_and_pinned). For the note and --json only, never to choose.
+    other_requirements: list[tuple[Path, bool]] = field(default_factory=list)
 
 
 @dataclass
@@ -176,12 +180,19 @@ class Source:
     root_groups: dict[int, str] = field(default_factory=dict)
     # uv.lock only: the project's requires-python. uv keeps only the wheels that can serve it.
     requires_python: str | None = None
+    # uv.lock only: its supported-markers, the project's [tool.uv] environments. When there are any, uv locked
+    # for those environments only: `uv sync` fails anywhere else, and the lock leaves out the packages and wheels
+    # that only other environments need (see check.check_lock_environments).
+    supported_markers: list[str] = field(default_factory=list)
     # Scripts and pyproject.toml: uv's exclude-newer (#521). A file uploaded at or after the cutoff isn't installed;
     # exclude-newer-package gives the packages it names their own cutoff, or none (uv's `false`: None here).
     exclude_newer: datetime | None = None
     exclude_newer_package: dict[str, datetime | None] = field(default_factory=dict)
     # A uv setting that may set a cutoff here but that wheelgap doesn't read, for a note.
     exclude_newer_unread: str | None = None
+    # The cutoffs above that came from a duration ("3 days"), which uv counts back from the time it resolves and
+    # wheelgap from the time of the run: each setting as written, with the cutoff it gave, for a note.
+    exclude_newer_durations: list[str] = field(default_factory=list)
     # Retain uv edge provenance for an explicit installation selection. The existing flattened
     # graph remains untouched, preserving conservative behavior when no selectors are supplied.
     uv_packages: list[dict] | None = None
@@ -255,6 +266,9 @@ class Source:
     deps_blockers: list[str] = field(default_factory=list)
     # A requirements file's --no-binary/--only-binary policy, applied to the resolved packages too.
     format_control: _FormatControl | None = None
+    # A requirements file's options that pip ignores after a requirement (`jax==0.4.25 -f URL`), for notes:
+    # `requirements.txt:2: pip ignores -f after a requirement`, once per file and option.
+    ignored_options: list[str] = field(default_factory=list)
     # --deps (deps.py): per target, the packages installed and the dependency path to each, keyed by index into
     # `packages`. check() uses it in place of a lockfile's graph.
     deps_paths: dict[Target, dict[int, list[str]]] | None = None
@@ -681,6 +695,10 @@ def parse_uv_lock(path: Path) -> Source:
         source.edges = None  # no idea where the graph starts; treat every package as needed
     if isinstance(data.get("requires-python"), str):
         source.requires_python = data["requires-python"]
+    supported = data.get("supported-markers", [])
+    if not isinstance(supported, list) or not all(isinstance(marker, str) for marker in supported):
+        raise SourceError(f"{path.name}: `supported-markers` isn't a list of strings")
+    source.supported_markers = supported
     return source
 
 
@@ -1543,7 +1561,9 @@ def _read_exclude_newer(source: Source, data: dict, path: Path, script: bool) ->
     """uv's exclude-newer and exclude-newer-package for this input (#521): from a script's own [tool.uv], or for a
     pyproject.toml from a uv.toml beside it when there is one (uv then ignores [tool.uv]), else its [tool.uv]. For a
     workspace member, uv reads the workspace root's settings in the same way and ignores the member's. A cutoff is a
-    timestamp or a date; uv's relative durations are refused, and so is anything else."""
+    timestamp, a date or a duration counted back from now (cutoff.parse_cutoff); anything else is refused. (uv
+    0.13.1 itself warns about a value it can't read and then ignores the file's settings; wheelgap stops, since the
+    project meant to set a cutoff.)"""
     workspace = None if script else _workspace_root(path, data)
     if script:
         settings, config = _table(_table(data, "tool"), "uv"), path
@@ -1568,14 +1588,23 @@ def _read_exclude_newer(source: Source, data: dict, path: Path, script: bool) ->
                 f"workspace root's settings ({config}), and so does wheelgap"
             )
     where = f"{config}:" if config.name == "uv.toml" else f"{config}: [tool.uv]"
-    if "exclude-newer" in settings:
+    now = cutoffs.current_time()  # one time for every duration in the file
+
+    def read(setting: str, value: object, or_false: str = "") -> datetime:
         try:
-            source.exclude_newer = parse_cutoff(settings["exclude-newer"])
+            cutoff = parse_cutoff(value, now)
         except ValueError as e:
+            table = " (wheelgap doesn't read uv's table form)" if isinstance(value, dict) else ""
             raise SourceError(
-                f"{where} exclude-newer must be a date or RFC 3339 timestamp: {e} "
-                "(wheelgap doesn't read uv's relative durations)"
+                f"{where} {setting} must be a date, an RFC 3339 timestamp{or_false or ' or'} a duration: {e}{table}"
             ) from None
+        if is_duration(value):
+            source.exclude_newer_durations.append(f'{setting} = "{value}" is {describe(cutoff)}')
+        return cutoff
+
+    # `exclude-newer = false` turns off a cutoff from settings uv reads before these (the user's own): none here.
+    if settings.get("exclude-newer", False) is not False:
+        source.exclude_newer = read("exclude-newer", settings["exclude-newer"], ", false or")
     per_package = settings.get("exclude-newer-package", {})
     if not isinstance(per_package, dict):
         raise SourceError(f"{where} exclude-newer-package must be a table of package names")
@@ -1583,13 +1612,9 @@ def _read_exclude_newer(source: Source, data: dict, path: Path, script: bool) ->
         key = canonicalize_name(name)
         if key in source.exclude_newer_package:
             raise SourceError(f"{where} exclude-newer-package names {key!r} twice once normalized")
-        try:
-            source.exclude_newer_package[key] = None if value is False else parse_cutoff(value)
-        except ValueError as e:
-            raise SourceError(
-                f"{where} exclude-newer-package {name} must be a date, an RFC 3339 timestamp or false: {e} "
-                "(wheelgap doesn't read uv's relative durations)"
-            ) from None
+        source.exclude_newer_package[key] = (
+            None if value is False else read(f"exclude-newer-package {name}", value, ", false or")
+        )
     if workspace is None:  # a workspace root always has settings: uv looks no further up
         source.exclude_newer_unread = _unread_exclude_newer(path, script)
 
@@ -2025,26 +2050,34 @@ class _FormatControl:
         return (False, False)
 
 
-def _join_continued_lines(text: str) -> list[str]:
-    """Joins backslash-continued non-comment lines without inserting spaces, matching pip's join_lines."""
-    joined: list[str] = []
+def _numbered_lines(text: str) -> list[tuple[int, str]]:
+    """Joins backslash-continued non-comment lines without inserting spaces, matching pip's join_lines. Each comes
+    with the number of the line it starts on, which is the one pip names in its errors."""
+    joined: list[tuple[int, str]] = []
     pending: list[str] = []
-    for line in text.splitlines():
+    start = 0
+    for number, line in enumerate(text.splitlines(), 1):
         is_comment = _FULL_LINE_COMMENT_RE.match(line) is not None
+        if not pending:
+            start = number
         if not line.endswith("\\") or is_comment:
             if is_comment:
                 line = " " + line
             if pending:
                 pending.append(line)
-                joined.append("".join(pending))
+                joined.append((start, "".join(pending)))
                 pending.clear()
             else:
-                joined.append(line)
+                joined.append((start, line))
         else:
             pending.append(line.strip("\\"))
     if pending:
-        joined.append("".join(pending))
+        joined.append((start, "".join(pending)))
     return joined
+
+
+def _join_continued_lines(text: str) -> list[str]:
+    return [line for _, line in _numbered_lines(text)]
 
 
 def _format_option(token: str) -> tuple[str, str | None] | None:
@@ -2113,6 +2146,7 @@ def parse_requirements(path: Path, constraint_paths: tuple[Path, ...] = ()) -> S
     format_control = _FormatControl()
     req_lines: list[str] = []
     compiler_signs: list[str] = []
+    ignored_options: dict[tuple[Path, str], str] = {}
     pkgs: list[Package] = []
     for constraint_path in constraint_paths:
         # What it returns is the requirements of a -r inside the constraints file (pip's rule): keep them, as
@@ -2127,6 +2161,7 @@ def parse_requirements(path: Path, constraint_paths: tuple[Path, ...] = ()) -> S
                 format_control=format_control,
                 req_lines=req_lines,
                 compiler_signs=compiler_signs,
+                ignored_options=ignored_options,
             )
         )
     pkgs.extend(
@@ -2138,9 +2173,12 @@ def parse_requirements(path: Path, constraint_paths: tuple[Path, ...] = ()) -> S
             format_control=format_control,
             req_lines=req_lines,
             compiler_signs=compiler_signs,
+            ignored_options=ignored_options,
         )
     )
-    return _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    source = _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    source.ignored_options = list(ignored_options.values())
+    return source
 
 
 def _finalize_requirements(
@@ -2211,23 +2249,157 @@ def _finalize_requirements(
     )
 
 
+def _shown(p: Path, stack: list[Path]) -> str:
+    # Names are relative to the folder the run started in, so two files with the same name in different
+    # folders stay distinguishable (a file outside that folder is ../name). Forward slashes on every
+    # platform, as the include lines themselves are written.
+    try:
+        return Path(os.path.relpath(p, stack[0].parent)).as_posix()
+    except ValueError:  # on another Windows drive: no relative path exists
+        return p.name
+
+
 def _cycle_error(path: Path, line: str, target_path: Path, stack: list[Path]) -> SourceError:
-    # Names in the chain are relative to the folder the run started in, so two files with the same
-    # name in different folders stay distinguishable (a file outside that folder is ../name). Forward slashes
-    # on every platform, as the include lines themselves are written. The chain names files as they were
-    # written, so a cycle through a link names the link, as pip names it.
-    base = stack[0].parent
-
-    def show(p: Path) -> str:
-        try:
-            return Path(os.path.relpath(p, base)).as_posix()
-        except ValueError:  # on another Windows drive: no relative path exists
-            return p.name
-
+    # The chain names files as they were written, so a cycle through a link names the link, as pip names it.
     return SourceError(
-        f"{show(path)}: {line} includes a file that is already being read "
-        f"({' -> '.join(show(p) for p in (*stack, target_path))}); pip refuses this"
+        f"{_shown(path, stack)}: {line} includes a file that is already being read "
+        f"({' -> '.join(_shown(p, stack) for p in (*stack, target_path))}); pip refuses this"
     )
+
+
+def _include_error(path: Path, number: int | None, line: str, error: OSError, stack: list[Path]) -> SourceError:
+    """An included file that can't be read, named by the line that includes it (pip stops here too: "Could not
+    open requirements file")."""
+    where = _shown(path, stack) + (f":{number}" if number is not None else "")
+    why = "file not found" if isinstance(error, FileNotFoundError) else (error.strerror or str(error)).lower()
+    return SourceError(f"{where}: {line}: {why}")
+
+
+# What pip 26.3 does with each option it reads after a requirement on the same line. It parses the rest of the line
+# with the parser it uses for option lines (break_args_options and build_parser in pip/_internal/req/req_file.py), so
+# an unknown option, an ambiguous abbreviation or a missing value is an error. handle_line then hands the requirement
+# only --hash and --config-settings, and never calls handle_option_line for the line, so the index, include and
+# finder options are dropped ("ignored"). Some still take effect, because their parser callback changes the install's
+# own settings as the line is parsed: --no-binary and --only-binary ("format", which wheelgap reads) and
+# --all-releases and --only-final ("release", which wheelgap doesn't), for the whole install. -e makes the line's
+# requirement an editable one, which pip refuses for a name. --use-feature turns the feature on for the run (its
+# parser list is shared), and no feature changes which file pip picks. Each entry: spellings, takes a value, kind.
+_REQUIREMENT_LINE_OPTIONS: tuple[tuple[tuple[str, ...], bool, str], ...] = (
+    (("-i", "--index-url", "--pypi-url"), True, "ignored"),
+    (("--extra-index-url",), True, "ignored"),
+    (("--no-index",), False, "ignored"),
+    (("-c", "--constraint"), True, "ignored"),
+    (("-r", "--requirement"), True, "ignored"),
+    (("-e", "--editable"), True, "editable"),
+    (("-f", "--find-links"), True, "ignored"),
+    (("--no-binary",), True, "format"),
+    (("--only-binary",), True, "format"),
+    (("--prefer-binary",), False, "ignored"),
+    (("--require-hashes",), False, "ignored"),
+    (("--no-require-hashes",), False, "ignored"),
+    (("--pre",), False, "ignored"),
+    (("--all-releases",), True, "release"),
+    (("--only-final",), True, "release"),
+    (("--trusted-host",), True, "ignored"),
+    (("--use-feature",), True, "feature"),
+    (("--hash",), True, "hash"),
+    (("-C", "--config-settings"), True, "requirement"),
+)
+_USE_FEATURE_CHOICES = (
+    "fast-deps",
+    "inprocess-build-deps",
+    "venv-isolation",
+    "truststore",
+    "no-binary-enable-wheel-cache",
+    "build-constraint",
+)
+_LONG_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for name in entry[0] if name.startswith("--")}
+_SHORT_LINE_OPTIONS = {name: entry for entry in _REQUIREMENT_LINE_OPTIONS for name in entry[0] if len(name) == 2}
+
+
+def _requirement_options(text: str, where: str) -> tuple[bool, list[tuple[str, str]], list[tuple[str, str]]]:
+    """Reads the options after a requirement (`name>=1 --no-binary name`) as pip's optparse reads them: long options
+    by any unambiguous prefix, `--opt=value`, `-fVALUE`. Returns whether there's a --hash, each --no-binary or
+    --only-binary as (long name, value) in order, for the install's format control, and what pip ignores there, for
+    a note: each option as
+    (the name it was written with, its long name), and words that aren't options, which optparse sets aside, as one
+    entry. SourceError where pip refuses
+    the line, or where it applies an option that wheelgap doesn't read."""
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        raise SourceError(f"{where}: pip can't split this line (an unclosed quote?): {text}") from None
+    refused = f"{where}: pip refuses this line:"
+    hashed = False
+    formats: list[tuple[str, str]] = []
+    ignored: list[tuple[str, str]] = []
+    k = 0
+    while k < len(tokens):
+        token = tokens[k]
+        k += 1
+        if token == "--" or not token.startswith("-") or token == "-":
+            # optparse sets these words aside (and every word after --), and pip drops them
+            if token != "--" or k < len(tokens):
+                ignored.append(("words that aren't options", ""))
+            if token == "--":
+                break
+            continue
+        value: str | None
+        if token.startswith("--"):
+            option, eq, given = token.partition("=")
+            matches = (
+                [option] if option in _LONG_LINE_OPTIONS else [n for n in _LONG_LINE_OPTIONS if n.startswith(option)]
+            )
+            if not matches:
+                raise SourceError(f"{refused} no such option: {option}")
+            if len(matches) > 1:
+                raise SourceError(f"{refused} ambiguous option: {option} ({', '.join(sorted(matches))}?)")
+            name = matches[0]
+            names, takes_value, kind = _LONG_LINE_OPTIONS[name]
+            value = given if eq else None
+            if value is not None and not takes_value:
+                raise SourceError(f"{refused} {name} option does not take a value")
+        else:
+            name = token[:2]
+            if name not in _SHORT_LINE_OPTIONS:
+                raise SourceError(f"{refused} no such option: {name}")
+            names, takes_value, kind = _SHORT_LINE_OPTIONS[name]
+            value = token[2:] or None  # every short option pip reads here takes a value: -fURL
+        if takes_value and value is None:
+            if k >= len(tokens):
+                raise SourceError(f"{refused} {name} option requires 1 argument")
+            value = tokens[k]  # optparse takes the next word, even one that starts with "-"
+            k += 1
+        given_value = value or ""
+        # The checks pip's parser callbacks make (the first is a CommandError, the others optparse errors).
+        if kind == "format" and given_value.startswith("-"):
+            raise SourceError(f"{refused} --no-binary / --only-binary option requires 1 argument.")
+        if kind == "hash" and ":" not in given_value:
+            raise SourceError(
+                f"{refused} Arguments to --hash must be a hash name followed by a value, like --hash=sha256:abcde..."
+            )
+        if kind == "hash" and given_value.split(":", 1)[0] not in ("sha256", "sha384", "sha512"):
+            raise SourceError(f"{refused} Allowed hash algorithms for --hash are sha256, sha384, sha512.")
+        if kind == "requirement" and "=" not in given_value:
+            raise SourceError(f"{refused} Arguments to {name} must be of the form KEY=VAL")
+        if kind == "feature" and value not in _USE_FEATURE_CHOICES:
+            raise SourceError(f"{refused} option --use-feature: invalid choice: {value!r}")
+        if kind == "editable":
+            raise SourceError(
+                f"{where}: pip reads {name} after a requirement as making that requirement editable, and refuses it "
+                'for a name ("is not a valid editable requirement"); put the editable on a line of its own'
+            )
+        if kind == "release":
+            raise SourceError(
+                f"{where}: pip applies {name} after a requirement to the whole install, and it can change which "
+                "release pip picks; wheelgap doesn't read it"
+            )
+        if kind == "ignored":
+            ignored.append((name, names[-1]))  # -f and --find-links are one option
+        hashed = hashed or kind == "hash"
+        if kind == "format" and given_value:
+            formats.append((name, given_value))  # the value pip's callback reads, never a word after another option
+    return hashed, formats, ignored
 
 
 def _read_requirements(
@@ -2241,13 +2413,15 @@ def _read_requirements(
     compiler_signs: list[str] | None = None,
     stack: list[Path] | None = None,
     raw_lines: list[str] | None = None,
+    ignored_options: dict[tuple[Path, str], str] | None = None,
 ) -> list[Package]:
     """`index_options` collects the lines that may point pip at another index: index options (--index-url,
     --extra-index-url, --find-links, --no-index), includes that aren't read, and abbreviated include options.
     `req_lines` collects requirement lines that aren't constraints, for --deps; `compiler_signs` notes the
     `--hash` options and `# via` comments that mark pip-compile output, in requirement files only.
     `stack` is the chain of files being read, `-r` and `-c` together, as pip keeps it: by the path each
-    file was named with.
+    file was named with. `ignored_options` collects the options pip ignores after a requirement, once per file and
+    option, keyed by (resolved file, option), each a `path:line: ...` note.
 
     A file is read through the folder it was named in (`os.path.abspath`, no symlink resolution), as pip
     reads it, so an include in a symlinked file resolves against the link's folder, not the target's.
@@ -2267,8 +2441,12 @@ def _read_requirements(
     try:
         append = constraints.append if constraint else pkgs.append
         # utf-8-sig: a byte order mark (Windows editors) mustn't hide an option on the first line.
-        lines = raw_lines if raw_lines is not None else _join_continued_lines(path.read_text(encoding="utf-8-sig"))
-        for raw in lines:
+        numbered: list[tuple[int | None, str]] = (
+            [(None, raw) for raw in raw_lines]
+            if raw_lines is not None
+            else list(_numbered_lines(path.read_text(encoding="utf-8-sig")))
+        )
+        for number, raw in numbered:
             if compiler_signs is not None and not constraint and _VIA_COMMENT_RE.match(raw.lstrip()):
                 compiler_signs.append("via")  # pip-compile writes "# via <name>" comment lines
             line = _COMMENT_RE.split(raw, 1)[0].strip()  # " # note" or "<TAB># note"
@@ -2312,8 +2490,8 @@ def _read_requirements(
                     # A -r inside the constraints file is requirements, not more constraints (pip's rule),
                     # so what it returns is packages, not constraints: keep them. req_lines and compiler_signs
                     # are passed through for that -r file only: the constraints file's own lines add to neither.
-                    pkgs.extend(
-                        _read_requirements(
+                    try:
+                        included = _read_requirements(
                             path.parent / target,
                             seen,
                             constraints,
@@ -2323,8 +2501,11 @@ def _read_requirements(
                             req_lines,
                             compiler_signs,
                             stack=stack,
+                            ignored_options=ignored_options,
                         )
-                    )
+                    except OSError as e:  # the constraints file itself: one it includes is a SourceError by now
+                        raise _include_error(path, number, line, e, stack) from e
+                    pkgs.extend(included)
                 elif not already_seen and index_options is not None:
                     index_options.append(line)
                 continue
@@ -2332,8 +2513,8 @@ def _read_requirements(
                 target_path = Path(os.path.abspath(path.parent / include[1]))
                 if target_path in stack:
                     raise _cycle_error(path, line, target_path, stack)
-                pkgs.extend(
-                    _read_requirements(
+                try:
+                    included = _read_requirements(
                         path.parent / include[1],
                         seen,
                         constraints,
@@ -2343,8 +2524,11 @@ def _read_requirements(
                         req_lines,
                         compiler_signs,
                         stack,
+                        ignored_options=ignored_options,
                     )
-                )
+                except OSError as e:  # the included file itself: one it includes is a SourceError by now
+                    raise _include_error(path, number, line, e, stack) from e
+                pkgs.extend(included)
                 continue
             if line.startswith("-e ") or line.startswith("--editable"):
                 if not already_seen:
@@ -2355,20 +2539,31 @@ def _read_requirements(
                 if format_control is not None:
                     _apply_format_options(line, format_control)
                 continue  # pip options: --index-url, --no-binary, --hash continuation, ...
+            # The requirement ends where pip ends it: before the first word, split at single spaces, that starts
+            # with "-" (break_args_options), so "name\t--no-binary x" is one requirement pip can't parse. The rest is
+            # options: --hash=sha256:..., "--hash sha256:...", --no-binary NAMES.
+            words = line.split(" ")
+            first_option = next((k for k, word in enumerate(words) if word.startswith("-")), len(words))
+            options = " ".join(word for word in words[first_option:] if word)
+            hashed = False
+            if options:
+                where = _shown(path, stack) + (f":{number}" if number is not None else "")
+                hashed, formats, ignored = _requirement_options(options, where)
+                if ignored_options is not None:
+                    for shown, option in ignored:
+                        note = f"{where}: pip ignores {shown} after a requirement"
+                        ignored_options.setdefault((resolved, option), note)
+                if format_control is not None:
+                    # Each time the line is read, as for an option line: pip reads a file included twice twice,
+                    # and the later option wins.
+                    for format_option, format_value in formats:
+                        format_control.apply(format_option, format_value)
             if already_seen:
                 continue
-            tokens = line.split()
             # Only on requirement lines: a --hash or "# via" in a constraints file never marked the input compiled.
-            if (
-                compiler_signs is not None
-                and not constraint
-                and any(t == "--hash" or t.startswith("--hash=") for t in tokens)
-            ):
+            if hashed and compiler_signs is not None and not constraint:
                 compiler_signs.append("hash")
-            # Drop --hash=sha256:... and "--hash sha256:..." (option and value as two tokens).
-            line = " ".join(
-                t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
-            )
+            line = " ".join(words[:first_option]).strip()
             if line.startswith((".", "/")):
                 append(Package(line, None, skip="path", origin=path.name))
                 continue
@@ -3004,6 +3199,7 @@ def parse_conda_env(path: Path) -> Source:
     format_control = _FormatControl()
     req_lines: list[str] = []
     compiler_signs: list[str] = []
+    ignored_options: dict[tuple[Path, str], str] = {}
     pkgs = _read_requirements(
         path,
         seen,
@@ -3013,9 +3209,12 @@ def parse_conda_env(path: Path) -> Source:
         req_lines=req_lines,
         compiler_signs=compiler_signs,
         raw_lines=pip_lines,
+        ignored_options=ignored_options,
     )
     pkgs.extend(conda_skips)
-    return _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    source = _finalize_requirements(path, pkgs, constraints, index_options, format_control, req_lines, compiler_signs)
+    source.ignored_options = list(ignored_options.values())
+    return source
 
 
 READERS = {
@@ -3195,6 +3394,63 @@ def _other_requirements(directory: Path) -> list[Path]:
     return found
 
 
+# The first line pip-compile and uv (`uv pip compile`, `uv export`) write.
+_COMPILER_HEADER_RE = re.compile(r"^#\s*This file (?:is|was) autogenerated by (?:pip-compile|uv)\b", re.MULTILINE)
+
+
+# A file beside pyproject.toml is opened only for a hint, so a bigger one is passed over unread (compiled locks of
+# large projects are well under this).
+_HINT_MAX_BYTES = 2_000_000
+
+
+def _looks_compiled_and_pinned(path: Path) -> bool:
+    """Whether a requirements file looks like a compiler's full pin list (pip-compile, `uv pip compile`, `uv export`):
+    it has their mark (their header, `# via` comments or `--hash` options), and it reads without an error, lists at
+    least one package from an index, and pins each to one version (`==` or `===`, from its line or a -c constraint).
+    A hint for the note beside pyproject.toml only: such a file may as well be the build tools' or the docs' pins
+    (flask's requirements/build.txt), so it is never read in pyproject.toml's place. Only the file itself is read:
+    one over _HINT_MAX_BYTES, or one with a -r or -c (which may name any file: a FIFO, a device, a huge one), doesn't
+    look compiled."""
+    try:
+        if path.stat().st_size > _HINT_MAX_BYTES:
+            return False
+        text = path.read_text(encoding="utf-8-sig")
+        for _, raw in _numbered_lines(text):
+            line = _COMMENT_RE.split(raw, 1)[0].strip()
+            if line.startswith("-") and (_line_include(shlex.split(line), path.name) or _abbreviated_include(line)):
+                return False
+        source = load_file(path)
+    except Exception:  # unreadable or malformed: it doesn't look like anything
+        return False
+    marked = (
+        source.compiled
+        or _COMPILER_HEADER_RE.search(text) is not None
+        or any(_VIA_COMMENT_RE.match(line.lstrip()) for line in text.splitlines())
+    )
+    packages = [p for p in source.packages if not p.skip]
+    return marked and bool(packages) and all(p.version is not None and p.error is None for p in packages)
+
+
+def _requirements_beside_pyproject(directory: Path) -> list[tuple[Path, bool]]:
+    """The requirements files under other names at a root whose pyproject.toml was read (_other_requirements, and
+    requirements*.lock at the root, which `wheelgap FILE` reads but directory mode doesn't), each with whether it
+    looks compiled and pinned; those first."""
+    try:
+        locks = sorted(
+            directory / entry.name
+            for entry in os.scandir(directory)
+            if entry.is_file()
+            and entry.name.startswith("requirements")
+            and entry.name.endswith(".lock")
+            and not entry.name.endswith(".py.lock")  # a script's lock, by file_kind
+            and entry.name not in LOCKFILES
+        )
+    except OSError:
+        locks = []
+    found = [(path, _looks_compiled_and_pinned(path)) for path in [*_other_requirements(directory), *locks]]
+    return [entry for entry in found if entry[1]] + [entry for entry in found if not entry[1]]
+
+
 def _unread_project(directory: Path) -> str | None:
     """The file at the root that holds the project's own dependencies where wheelgap doesn't read them (setup.py,
     setup.cfg, or a pyproject.toml load_file refused or took no project from), or None. With one, an input in a
@@ -3358,6 +3614,7 @@ def load_directory(directory: Path, environment: str | None = None) -> Source:
             if not source.pyproject_groups_only:
                 source.found = DirectoryInput(directory, pyproject, "pyproject")
                 if _nothing_to_check(source) is None or source.pyproject_extras:
+                    source.found.other_requirements = _requirements_beside_pyproject(directory)
                     return source
                 last_resort = source
     empty = [(pyproject, "no dependencies")] if last_resort is not None else []

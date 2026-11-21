@@ -46,7 +46,10 @@ still checked, so a possible gap is reported rather than hidden. See
 
 - `--online` re-checks lockfile packages against PyPI. Packages the lock says came from another index keep their
   locked files, so their names are never sent to PyPI. Use it when a project has uploaded new wheels for an existing
-  version since you locked, or if your `uv.lock` was generated with `environments` restrictions.
+  version since you locked.
+- A `uv.lock` made with `[tool.uv] environments` is locked for those environments only: uv leaves out what other
+  platforms need and `uv sync` fails there, so (after 0.13.0) a target outside them is an error rather than a list
+  of gaps, and the default targets are narrowed to the ones the lock covers. See [uv.lock](inputs.md#uvlock).
 - A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with
   `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without
   `--online`, wheelgap then also looks up its PyPI packages on the index, keeps the lock's own files if a lookup fails,

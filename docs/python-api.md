@@ -90,7 +90,9 @@ check_lockfile(
 Check every package a lockfile (or a project directory) installs on at least one target. Environment markers and the
 `uv.lock` dependency graph are respected, as on the command line. A `uv.lock` whose `requires-python` leaves out a
 target's Python may be missing wheels for it, so its PyPI packages are also looked up on the index (keeping the
-lock's files if a lookup fails).
+lock's files if a lookup fails). A `uv.lock` made with `[tool.uv] environments` covers those environments only, so
+(after 0.13.0) a target outside them raises `SourceError`, as on the [command line](inputs.md#uvlock). With no
+`targets`, the default platforms are narrowed to the ones it covers.
 
 - `deps=True` resolves the dependency tree for requirements files, a conda `environment.yml` (its `pip:` list),
   `pyproject.toml` and script (`# /// script`) inputs from

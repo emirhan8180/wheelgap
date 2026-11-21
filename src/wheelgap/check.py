@@ -26,6 +26,7 @@ from .sources import (
     Package,
     PoetryExtras,
     Source,
+    SourceError,
     UvSelection,
     uv_extra_names,
     uv_group_names,
@@ -572,6 +573,93 @@ def marker_holds(
     """Whether `marker` can hold on `target`: unknown counts as holding, to assume a package is needed rather than
     hide a gap."""
     return marker_value(marker, target, extras=extras, groups=groups) is not False
+
+
+def lock_environment_targets(source: Source, targets: Iterable[Target]) -> tuple[list[Target], list[Target]]:
+    """The targets a uv.lock's supported-markers leave out, and those they can't be decided for.
+
+    The markers are the project's `[tool.uv] environments`. `uv sync` installs the lock only where one of them
+    holds, and fails anywhere else ("The current Python platform is not compatible with the lockfile's supported
+    environments"):
+    https://github.com/astral-sh/uv/blob/0.13.9/crates/uv-environment-operations/src/sync.rs#L174-L196
+    A target is undecided when no marker holds for sure and one depends on something the target doesn't fix
+    (platform_release, platform_machine on win32, a patch release of Python) or doesn't parse.
+    """
+    outside: list[Target] = []
+    undecided: list[Target] = []
+    if source.supported_markers:
+        for target in targets:
+            values = {marker_value(marker, target) for marker in source.supported_markers}
+            if True not in values:
+                (undecided if None in values else outside).append(target)
+    return outside, undecided
+
+
+def check_lock_environments(source: Source, targets: Iterable[Target]) -> None:
+    """SourceError unless every target is in the environments a uv.lock was locked for.
+
+    uv resolves such a lock for its environments only: it drops the packages only other environments need (a
+    Windows-only dependency in a Linux-only lock) and the wheels for other platforms, so reading it for another
+    target would report gaps that aren't there and miss packages that are. `uv sync` refuses to install it there.
+    """
+    targets = list(targets)
+    outside, undecided = lock_environment_targets(source, targets)
+    if not outside and not undecided:
+        return
+    with_python = len({t.python for t in targets}) > 1
+
+    def names(some: list[Target]) -> str:
+        return ", ".join(t.label(with_python) for t in some)
+
+    markers = "; ".join(source.supported_markers)
+    if not outside:
+        raise SourceError(
+            f"{source.label}: can't tell whether this lock covers {names(undecided)}: it was locked for "
+            f"`[tool.uv] environments` only ({markers}), which those targets don't decide, and `uv sync` fails "
+            "outside them; check targets the markers decide"
+        )
+    covered = [t for t in targets if t not in outside and t not in undecided]
+    raise SourceError(
+        f"{source.label}: this lock doesn't cover {names(outside)}: it was locked for `[tool.uv] environments` "
+        f"only ({markers}), so `uv sync` fails there and the lock leaves out the packages and wheels other "
+        "environments need; "
+        + (
+            f"of the targets asked for it covers {names(covered)}"
+            if covered
+            else "it covers none of the targets asked for"
+        )
+        + " (to check the others, add them to environments and run `uv lock`)"
+    )
+
+
+def narrow_to_lock_environments(
+    sources: Iterable[Source], targets: list[Target], *, every: bool = False
+) -> tuple[list[Target], list[str]]:
+    """Targets nobody named (the default platforms, or --advisory ones) without the platforms a uv.lock made with
+    `[tool.uv] environments` leaves out for every Python asked for, and those platforms. With several locks a
+    platform goes when one of them leaves it out; with every=True (`wheelgap diff`) only when all of them do, so a
+    platform one side gives up stays and check_lock_environments refuses it. A platform covered for some of the
+    Pythons only stays, and is refused there too. Nothing goes when no target would be left."""
+    sources = list(sources)
+    if not any(source.supported_markers for source in sources):
+        return targets, []
+    # A lock without environments leaves nothing out, so with every=True it keeps every platform.
+    outside = [set(lock_environment_targets(source, targets)[0]) for source in sources]
+    unlocked = set.intersection(*outside) if every else set.union(*outside)
+    locked = {t.platform for t in targets if t not in unlocked}
+    left_out = list(dict.fromkeys(t.platform for t in targets if t.platform not in locked))
+    if not locked or not left_out:
+        return targets, []
+    return [t for t in targets if t.platform in locked], left_out
+
+
+def lock_environments_note(sources: Iterable[Source], left_out: list[str], kept: list[Target], what: str) -> str:
+    labels = ", ".join(dict.fromkeys(source.label for source in sources if source.supported_markers))
+    checked = ", ".join(dict.fromkeys(t.platform for t in kept))
+    return (
+        f"{labels} is locked for `[tool.uv] environments` only, which leave out {', '.join(left_out)}: "
+        f"checking the {what} it covers ({checked})"
+    )
 
 
 # How a package was reached: the index of the package that depends on it, the name of the

@@ -385,6 +385,49 @@ def test_requirements_line_pip_cant_split_exits_2(capsys, tmp_path, fake_pypi):
     assert "requirements.txt" in err and "-r 'unclosed" in err
 
 
+def test_requirements_missing_include_exits_2_with_the_line(capsys, fake_pypi, tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("purewheel==3.1\n-r _base.txt\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64")
+    assert (code, out, err) == (2, "", "wheelgap: error: requirements.txt:2: -r _base.txt: file not found\n")
+    assert fake_pypi == []
+    code, out, _ = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    assert code == 2
+    assert json.loads(out)["error"]["message"] == "requirements.txt:2: -r _base.txt: file not found"
+
+
+def test_requirement_line_no_binary_is_honoured_as_pip_does(capsys, fake_pypi, tmp_path):
+    # pip 26.3 takes no wheel for either here: --no-binary after a requirement counts for the whole install.
+    # (The fake purewheel has no sdist, so with its wheel ruled out nothing is left.)
+    req = tmp_path / "requirements.txt"
+    req.write_text("purewheel==3.1\nfastlib==2.0.0 --no-binary purewheel,fastlib\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    results = {p["name"]: p["results"]["linux-x86_64"] for p in json.loads(out)["packages"]}
+    assert results == {"fastlib": "source", "purewheel": "missing"} and code == 1
+    req.write_text("purewheel==3.1\nfastlib==2.0.0\n", encoding="utf-8")
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    results = {p["name"]: p["results"]["linux-x86_64"] for p in json.loads(out)["packages"]}
+    assert results == {"fastlib": "wheel", "purewheel": "wheel"} and code == 0
+
+
+def test_requirement_line_option_pip_ignores_is_a_note(capsys, fake_pypi, tmp_path):
+    # xai-org/grok-1's requirements.txt has `jax[cuda12-pip]==0.4.25 -f https://...`: pip 26.3 ignores the -f there
+    # and installs the requirement from PyPI, so wheelgap checks it on PyPI and says it left the option out.
+    req = tmp_path / "requirements.txt"
+    req.write_text(
+        "purewheel==3.1\nfastlib[extra]==2.0.0 -f https://user:secret@example.invalid/wheels.html\n"
+        "nowheels==0.9 --find-links ./w\n",
+        encoding="utf-8",
+    )
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "--json")
+    results = {p["name"]: p["results"]["linux-x86_64"] for p in json.loads(out)["packages"]}
+    assert results == {"purewheel": "wheel", "fastlib": "wheel", "nowheels": "source"} and code == 1
+    assert err.count("wheelgap: note: requirements.txt:2: pip ignores -f after a requirement\n") == 1
+    assert "--find-links" not in err and "secret" not in err and "example.invalid" not in err
+    code, out, err = run(capsys, str(req), "-p", "3.13", "-t", "linux-x86_64", "-q")
+    assert code == 1 and "pip ignores" not in err
+
+
 def test_requirements_include_cycle_exits_2(capsys, tmp_path, monkeypatch):
     # pip refuses an include cycle, so wheelgap does too: exit code 2, and the same error with
     # --github-annotations, since the file is parsed before any line is looked up (#603).
@@ -1418,6 +1461,170 @@ def test_lock_inside_requires_python_stays_offline(capsys, fake_pypi, tmp_path):
     assert fake_pypi == []
 
 
+def environments_lock(*markers):
+    """A uv.lock as uv writes it for `[tool.uv] environments = [markers]`: the wheels for other platforms are left
+    out (uv 0.13.1 keeps only the Linux x86_64 ones for the first marker in LINUX_ONLY)."""
+    supported = "supported-markers = [\n" + "".join(f"    {json.dumps(m)},\n" for m in markers) + "]\n"
+    return LOCK_312_ONLY.replace('"==3.12.*"\n', '">=3.12"\n' + supported)
+
+
+LINUX_ONLY = ("platform_machine == 'x86_64' and sys_platform == 'linux'",)
+
+
+def test_lock_environments_refuse_a_target_outside_them(capsys, fake_pypi, tmp_path):
+    # Without the check, win-amd64 would read `source`: a gap that only says the lock left Windows out.
+    (tmp_path / "uv.lock").write_text(environments_lock(*LINUX_ONLY), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64,win-amd64,macos-arm64")
+    assert code == 2 and out == ""
+    assert "uv.lock: this lock doesn't cover win-amd64, macos-arm64: it was locked for `[tool.uv] environments`" in err
+    assert "(platform_machine == 'x86_64' and sys_platform == 'linux'), so `uv sync` fails there" in err
+    assert "of the targets asked for it covers linux-x86_64 (" in err
+    assert fake_pypi == []
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "win-amd64", "--json")
+    assert code == 2 and "it covers none of the targets asked for" in err
+    assert "this lock doesn't cover win-amd64" in json.loads(out)["error"]["message"]
+    # --online looks the locked packages up again, but not the ones the lock left out.
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", "win-amd64", "--online")[0] == 2
+
+
+def test_lock_environments_in_a_lock_uv_wrote(capsys, fake_pypi, fixtures):
+    code, out, err = run(capsys, str(fixtures / "uvenvironments"), "-p", "3.13", "--json")
+    data = json.loads(out)
+    assert code == 0 and [t["platform"] for t in data["targets"]] == ["linux-x86_64"]
+    assert "which leave out linux-aarch64, macos-arm64, win-amd64: checking the default targets it covers" in err
+    assert [(p["name"], p["results"]) for p in data["packages"]] == [("markupsafe", {"linux-x86_64": "wheel"})]
+    assert fake_pypi == []
+
+
+def test_lock_environments_leave_covered_targets_alone(capsys, fake_pypi, tmp_path):
+    answers = []
+    for lock in (environments_lock(*LINUX_ONLY), environments_lock()):  # the second has no limit
+        (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+        code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64", "--json")
+        assert code == 0 and "note:" not in err
+        answers.append(json.loads(out))
+    assert answers[0] == answers[1]
+    assert answers[0]["packages"][0]["results"] == {"linux-x86_64": "wheel"}
+
+
+def test_lock_environments_narrow_the_default_targets(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "--json")
+    assert [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64", "linux-aarch64"]
+    assert (
+        "wheelgap: note: uv.lock is locked for `[tool.uv] environments` only, which leave out macos-arm64, "
+        "win-amd64: checking the default targets it covers (linux-x86_64, linux-aarch64)\n"
+    ) in err
+    assert code == 1  # the lock's own gap on linux-aarch64 still counts
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "--json", "-q")
+    assert [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64", "linux-aarch64"] and err == ""
+    # The same platforms asked for by name are an error, and so is a lock that covers no default target.
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", ",".join(DEFAULT_PLATFORMS))[0] == 2
+    (tmp_path / "uv.lock").write_text(environments_lock("sys_platform == 'emscripten'"), encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12")
+    assert code == 2 and "it covers none of the targets asked for" in err and "note:" not in err
+
+
+def test_lock_environments_narrow_the_default_targets_in_diff(capsys, fake_pypi, tmp_path):
+    old, new = tmp_path / "old" / "uv.lock", tmp_path / "new" / "uv.lock"
+    for lock in (old, new):
+        lock.parent.mkdir()
+        lock.write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    code, _, err = run(capsys, "diff", str(old), str(new), "-p", "3.12")
+    assert code == 0 and "checking the default targets it covers (linux-x86_64, linux-aarch64)" in err
+    # A platform the new lock gives up is refused, not dropped.
+    old.write_text(environments_lock(), encoding="utf-8")
+    code, _, err = run(capsys, "diff", str(old), str(new), "-p", "3.12")
+    assert code == 2 and "this lock doesn't cover macos-arm64, win-amd64" in err
+    # A side that isn't a uv.lock leaves out nothing, so nothing is dropped: what the lock gives up is refused.
+    req = tmp_path / "requirements.txt"
+    req.write_text("markupsafe==3.0.2\n", encoding="utf-8")
+    old.write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    assert run(capsys, "diff", str(req), str(new), "-p", "3.12")[0] == 2
+    assert run(capsys, "diff", str(new), str(req), "-p", "3.12")[0] == 2
+
+
+def test_lock_environments_leave_out_advisory_targets(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(environments_lock(*LINUX_ONLY), encoding="utf-8")
+    args = ("-p", "3.12", "-t", "linux-x86_64,win-amd64", "--advisory", "win-amd64", "--json")
+    code, out, err = run(capsys, str(tmp_path), *args)
+    assert code == 0 and [t["platform"] for t in json.loads(out)["targets"]] == ["linux-x86_64"]
+    assert "which leave out the advisory targets win-amd64: not checking them" in err
+    # Asked for and required, it's still an error.
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64,win-amd64")[0] == 2
+
+
+def test_lock_environments_narrowing_keeps_advisory_targets(capsys, fake_pypi, tmp_path):
+    (tmp_path / "uv.lock").write_text(environments_lock("sys_platform == 'linux'"), encoding="utf-8")
+    code, out, _ = run(capsys, str(tmp_path), "-p", "3.12", "--json", "--advisory", "linux-aarch64,win-amd64")
+    assert code == 0 and json.loads(out)["advisory"] == ["linux-aarch64"]
+
+
+@pytest.mark.parametrize(
+    "marker,python,covered",
+    [
+        ("python_full_version < '3.14' and sys_platform == 'linux'", "3.13", True),
+        ("python_full_version < '3.14' and sys_platform == 'linux'", "3.14", False),
+        ("python_full_version >= '3.14'", "3.13", False),
+        ("python_full_version >= '3.14'", "3.14t", True),
+        ("platform_python_implementation == 'CPython'", "3.13", True),
+        ("platform_python_implementation == 'PyPy'", "3.13", False),
+        ("implementation_name == 'cpython' and os_name == 'posix'", "3.13", True),
+        ("platform_machine == 'aarch64'", "3.13", False),
+        ("sys_platform != 'emscripten'", "3.13", True),
+        ("(sys_platform == 'darwin' or sys_platform == 'linux') and python_version < '3.14'", "3.13", True),
+    ],
+)
+def test_lock_environment_markers_are_evaluated_for_the_target(capsys, fake_pypi, tmp_path, marker, python, covered):
+    (tmp_path / "uv.lock").write_text(environments_lock(marker), encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", python, "-t", "linux-x86_64")
+    assert ("this lock doesn't cover linux-x86_64" in err) is not covered
+    assert (code == 2) is not covered
+
+
+def test_lock_environments_cover_a_target_if_any_marker_holds(capsys, fake_pypi, tmp_path):
+    lock = environments_lock("sys_platform == 'win32'", "sys_platform == 'linux'")
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12,3.13", "-t", "linux-x86_64,win-amd64,macos-arm64")
+    assert code == 2 and "this lock doesn't cover 3.12 macos-arm64, 3.13 macos-arm64: " in err
+    assert "it covers 3.12 linux-x86_64, 3.12 win-amd64, 3.13 linux-x86_64, 3.13 win-amd64 (" in err
+
+
+def test_lock_environments_cover_a_default_platform_for_some_pythons_only(capsys, fake_pypi, tmp_path):
+    # Python 3.14 was asked for, so leaving it out quietly would hide that `uv sync` fails there.
+    lock = environments_lock("python_full_version < '3.14' and sys_platform == 'linux'")
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.13,3.14")
+    assert code == 2 and "which leave out macos-arm64, win-amd64: checking" in err
+    assert "this lock doesn't cover 3.14 linux-x86_64, 3.14 linux-aarch64: " in err
+
+
+@pytest.mark.parametrize(
+    "marker,target",
+    [
+        ("platform_release == '6.1'", "linux-x86_64"),  # nothing a target fixes
+        ("platform_machine == 'AMD64'", "win32"),  # 32-bit Python on 64-bit Windows says AMD64 or ARM64
+        ("python_full_version >= '3.12.4'", "linux-x86_64"),  # 3.12.0 no, 3.12.9 yes
+        ("not a marker", "linux-x86_64"),
+    ],
+)
+def test_lock_environments_that_a_target_cannot_decide_are_not_guessed(capsys, fake_pypi, tmp_path, marker, target):
+    (tmp_path / "uv.lock").write_text(environments_lock(marker), encoding="utf-8")
+    code, out, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", target)
+    assert code == 2 and out == ""
+    assert f"uv.lock: can't tell whether this lock covers {target}: it was locked for" in err
+    # A marker that does hold settles it, whatever the others say.
+    (tmp_path / "uv.lock").write_text(environments_lock(marker, "os_name != 'java'"), encoding="utf-8")
+    assert run(capsys, str(tmp_path), "-p", "3.12", "-t", target)[0] != 2
+
+
+def test_lock_environments_must_be_a_list_of_markers(capsys, tmp_path):
+    lock = LOCK_312_ONLY.replace("version = 1\n", "version = 1\nsupported-markers = \"sys_platform == 'linux'\"\n", 1)
+    (tmp_path / "uv.lock").write_text(lock, encoding="utf-8")
+    code, _, err = run(capsys, str(tmp_path), "-p", "3.12", "-t", "linux-x86_64")
+    assert code == 2 and "uv.lock: `supported-markers` isn't a list of strings" in err
+
+
 def test_failed_recheck_keeps_the_lock_answers(capsys, tmp_path, monkeypatch):
     import urllib.error
 
@@ -2361,7 +2568,11 @@ def _assert_matches_output_schema(data):
         assert set(item) == {"name", "reason"}
         assert isinstance(item["name"], str) and isinstance(item["reason"], str)
     summary = data["summary"]
-    assert set(summary) == {"packages", "with_gaps", "per_target"}
+    # complete: only with --dockerfile-inputs, and false exactly when dockerfile_warnings lists a line.
+    assert set(summary) - {"complete"} == {"packages", "with_gaps", "per_target"}
+    assert ("complete" in summary) == ("dockerfile_warnings" in data)
+    if "complete" in summary and data["dockerfile_warnings"]:
+        assert summary["complete"] is False  # also false when -p/-t stood in for an unread image
     distinct_names = {pkg["name"] for pkg in data["packages"]}
     assert len(distinct_names) <= summary["packages"] <= len(data["packages"])
     assert isinstance(summary["with_gaps"], int) and 0 <= summary["with_gaps"] <= summary["packages"]
@@ -3666,6 +3877,15 @@ def test_github_annotations_requirements_lines(capsys, fake_pypi, tmp_path, monk
     # A continued requirement is on the first line with something on it.
     req.write_text("purewheel==3.1\n\\\n\\\nnowheels==0.9\n", encoding="utf-8")
     assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=4,"]
+
+
+def test_github_annotations_requirement_with_options_keeps_its_line(capsys, fake_pypi, tmp_path, monkeypatch):
+    # The requirement ends where the parser ends it, before its options, so the line still matches.
+    monkeypatch.setenv("GITHUB_WORKSPACE", str(tmp_path))
+    req = tmp_path / "requirements.txt"
+    for line in ("nowheels==0.9 -f https://example.invalid/w.html", "nowheels==0.9 --no-binary nowheels"):
+        req.write_text(f"purewheel==3.1\n{line}\n", encoding="utf-8")
+        assert annotate(capsys, tmp_path, str(req)) == ["::error file=requirements.txt,line=2,"]
 
 
 def test_github_annotations_requirements_include_after_options(capsys, fake_pypi, tmp_path, monkeypatch):
@@ -5108,14 +5328,147 @@ def test_project_exclude_newer_limits_range_resolution(fake_pypi, capsys, tmp_pa
     assert json.loads(out)["packages"][0]["version"] == "1.0"
 
 
-@pytest.mark.parametrize("value", ['"1 week"', '"2025-02-30"', '"2025-01-01T00:00:00"', "123"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"1 month"',  # uv refuses months and years: they have no fixed length
+        '"P1Y"',
+        '"3 fortnights"',
+        '"3 dayz"',
+        '" 3 days"',
+        '"1 day and 2 hours"',
+        '"5000000 days"',  # further back than uv's earliest timestamp
+        '"2025-02-30"',
+        '"2025-01-01T00:00:00"',
+        "123",
+        "true",
+        '{ timestamp = "2025-01-01T00:00:00Z", span = "P3D" }',  # uv's table form, which wheelgap doesn't read
+    ],
+)
 def test_project_exclude_newer_rejects_invalid_cutoffs(fake_pypi, capsys, tmp_path, value):
     path = tmp_path / "pyproject.toml"
     path.write_text(f'[project]\ndependencies = ["nowheels"]\n[tool.uv]\nexclude-newer = {value}\n', encoding="utf-8")
     code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64")
     assert code == 2
-    assert "exclude-newer" in err
+    assert f"{path}: [tool.uv] exclude-newer must be a date, an RFC 3339 timestamp, false or a duration: " in err
     assert fake_pypi == []
+
+
+RELEASED = {  # 2.0 came out on 2025-02-01; the tests below run "now" a few days later
+    "1.0": [{"filename": "dated-1.0-py3-none-any.whl", "upload_time_iso_8601": "2024-01-01T00:00:00Z"}],
+    "2.0": [{"filename": "dated-2.0-py3-none-any.whl", "upload_time_iso_8601": "2025-02-01T00:00:00Z"}],
+}
+
+
+@pytest.fixture
+def now_is(monkeypatch):
+    """Set the time uv's relative exclude-newer durations count back from."""
+    from datetime import datetime
+
+    from wheelgap import cutoff
+
+    def set_now(text):
+        monkeypatch.setattr(cutoff, "current_time", lambda: datetime.fromisoformat(text))
+
+    return set_now
+
+
+@pytest.mark.parametrize("script", [False, True])
+@pytest.mark.parametrize(
+    "duration, version, cutoff",
+    [
+        ("3 days", "1.0", "2025-01-31T00:00:00Z"),
+        ("P3D", "1.0", "2025-01-31T00:00:00Z"),
+        ("1 week", "1.0", "2025-01-27T00:00:00Z"),
+        ("1 day", "2.0", "2025-02-02T00:00:00Z"),
+        ("24 hours", "2.0", "2025-02-02T00:00:00Z"),
+        ("PT36H", "2.0", "2025-02-01T12:00:00Z"),
+        ("2 days", "1.0", "2025-02-01T00:00:00Z"),  # a file uploaded at the cutoff itself is left out, as by uv
+        ("47h 59m 59.999s", "2.0", "2025-02-01T00:00:00.001000Z"),
+        ("-3 days", "1.0", "2025-01-31T00:00:00Z"),  # uv takes the duration's absolute value
+        ("3 days ago", "1.0", "2025-01-31T00:00:00Z"),
+        ("0 days", "2.0", "2025-02-03T00:00:00Z"),
+    ],
+)
+def test_project_exclude_newer_duration_counts_back_from_now(
+    fake_pypi, capsys, tmp_path, monkeypatch, now_is, script, duration, version, cutoff
+):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    monkeypatch.delenv("UV_EXCLUDE_NEWER", raising=False)
+    now_is("2025-02-03T00:00:00+00:00")
+    if script:
+        path = tmp_path / "example.py"
+        text = f'# /// script\n# dependencies = ["dated>=1"]\n# [tool.uv]\n# exclude-newer = "{duration}"\n# ///\n'
+    else:
+        path = tmp_path / "pyproject.toml"
+        text = f'[project]\ndependencies = ["dated>=1"]\n[tool.uv]\nexclude-newer = "{duration}"\n'
+    path.write_text(text, encoding="utf-8")
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+    assert code == 0
+    assert json.loads(out)["packages"][0]["version"] == version
+    assert (
+        f"wheelgap: note: {path.name}: a duration counts back from the time of this run, as uv counts it back from "
+        f'the time it resolves: exclude-newer = "{duration}" is {cutoff}\n'
+    ) in err
+    # -q drops the note, not the cutoff.
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json", "-q")
+    assert json.loads(out)["packages"][0]["version"] == version and "a duration counts back" not in err
+
+
+def test_project_exclude_newer_duration_moves_with_the_clock(fake_pypi, capsys, tmp_path, monkeypatch, now_is):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\ndependencies = ["dated"]\n[tool.uv]\nexclude-newer = "1 week"\n', encoding="utf-8")
+    versions = []
+    for now in ("2025-02-07T23:59:59+00:00", "2025-02-08T00:00:00+00:00", "2025-02-08T00:00:00.001+00:00"):
+        now_is(now)
+        code, out, _ = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+        versions.append(json.loads(out)["packages"][0]["version"])
+    assert versions == ["1.0", "1.0", "2.0"]  # 2.0 is a week old one millisecond after 2025-02-08T00:00:00Z
+
+
+@pytest.mark.parametrize(
+    "settings, version, notes",
+    [
+        ('exclude-newer = "1 week"\nexclude-newer-package = { Dated = "1 day" }', "2.0", 2),
+        ('exclude-newer = "1 day"\nexclude-newer-package = { dated = "P1W" }', "1.0", 2),
+        ('exclude-newer = "2025-03-01"\nexclude-newer-package = { dated = "1 week" }', "1.0", 1),
+        ('exclude-newer = "1 week"\nexclude-newer-package = { dated = false }', "2.0", 1),
+        ('exclude-newer = "1 week"\nexclude-newer-package = { other = "1 day" }', "1.0", 2),
+        ("exclude-newer = false", "2.0", 0),  # uv: no cutoff, whatever the user's own settings say
+        ('exclude-newer = false\nexclude-newer-package = { dated = "30 days" }', "1.0", 1),
+    ],
+)
+def test_project_exclude_newer_durations_per_package(
+    fake_pypi, capsys, tmp_path, monkeypatch, now_is, settings, version, notes
+):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    monkeypatch.delenv("UV_EXCLUDE_NEWER", raising=False)
+    now_is("2025-02-03T00:00:00+00:00")
+    path = tmp_path / "pyproject.toml"
+    path.write_text(f'[project]\ndependencies = ["dated"]\n[tool.uv]\n{settings}\n', encoding="utf-8")
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+    assert code == 0 and json.loads(out)["packages"][0]["version"] == version
+    assert err.count("a duration counts back") == bool(notes) and err.count('" is 2025-') == notes
+
+
+def test_exclude_newer_duration_in_a_uv_toml_beside_it(fake_pypi, capsys, tmp_path, monkeypatch, now_is):
+    from conftest import FAKE_INDEX
+
+    monkeypatch.setitem(FAKE_INDEX, "dated", RELEASED)
+    now_is("2025-02-03T00:00:00+00:00")
+    (tmp_path / "uv.toml").write_text('exclude-newer = "3 days"\n', encoding="utf-8")
+    path = tmp_path / "pyproject.toml"
+    path.write_text('[project]\ndependencies = ["dated"]\n[tool.uv]\nexclude-newer = "1 day"\n', encoding="utf-8")
+    code, out, err = run(capsys, str(path), "-p", "3.13", "-t", "win-arm64", "--json")
+    assert code == 0 and json.loads(out)["packages"][0]["version"] == "1.0"
+    assert 'exclude-newer = "3 days" is 2025-01-31T00:00:00Z' in err
 
 
 DATED = {
@@ -5183,7 +5536,8 @@ def test_project_exclude_newer_package_overrides_the_cutoff(
 @pytest.mark.parametrize(
     "settings",
     [
-        'exclude-newer-package = { dated = "7 days" }',
+        'exclude-newer-package = { dated = "7 months" }',
+        'exclude-newer-package = { dated = "7 dys" }',
         "exclude-newer-package = { dated = true }",
         'exclude-newer-package = "2025-01-01"',
         'exclude-newer-package = { dated = "2025-01-01", Dated = "2025-01-02" }',

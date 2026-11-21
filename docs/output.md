@@ -469,8 +469,34 @@ one entry per directory: the `directory` as it was given, the `file` relative to
 name; `pyproject`: the root's `pyproject.toml`; `requirements`: the root's only requirements file under another name;
 `subfolder`: the only input below the root, which `sources` then names by the same relative path, as in
 `scripts/requirements.txt`, where every other input has its file name only) and `empty`, the files that come first in the search but had nothing to
-check, each with its `file` and `why` (`[]` in the usual case). The key is absent when no input was a directory. See
+check, each with its `file` and `why` (`[]` in the usual case), and `other_requirements`: with the reason
+`pyproject`, the root's requirements files under other names, which weren't read, each with its `file` and
+`compiled`, whether it looks like `pip-compile`, `uv pip compile` or `uv export` output that pins everything (a hint
+for which to check next, never used to choose; those come first), and `[]` otherwise. The key is absent when no input was a directory. See
 [Which file is read](inputs.md#which-file-is-read).
+`dockerfile_notes` (after 0.13.0) lists what a `--dockerfile` answer leaves out, one object each: the `dockerfile`
+path as given, the `line` it is about (or `null`), a `kind` to match on and the `message` the note on stderr has.
+The kinds: `image-not-read` (`-p` and `-t` stood in for an [image wheelgap can't read](cli.md#dockerfile));
+`image-libc` (that image's tag says Alpine or musl, and glibc targets were checked);
+`passed-over:CLASS`, one per class of `RUN` line [`--dockerfile-inputs`](cli.md#dockerfile-inputs) didn't read
+because it installs no Python packages with pip or uv (`system-packages`, `shell`, `programs`, `venv`,
+`cache-mounts`, `copy-from`, `installer-tools`), with `line` `null` and the line numbers in `lines`; `arg-unset` (an
+`ARG PIP_...` with no default, read as unset); and `system-python-packages` (system package commands on `lines`
+install Python packages, which pip may keep instead of fetching a requirement). The key is absent when there is
+nothing to say.
+
+`dockerfile_packages` (after 0.13.0) has one entry per `RUN` line whose `pip install` names requirements on the
+line itself: `dockerfile`, `line`, the `installer` (`pip` or `uv pip`) and the `requirements` as written, variables
+replaced. The line is also a source of its own in `sources` (`Dockerfile:5`). `kind` `arg-value` in
+`dockerfile_notes` says an install used an `ARG`'s default or a `--build-arg` value.
+
+`dockerfile_warnings` (after 0.13.0, always there with `--dockerfile-inputs`) lists the `RUN` lines wheelgap
+couldn't see into, which may install Python packages the answer doesn't have: `dockerfile`, `line`, `kind`
+(`may-install`, or `may-bring` for a `COPY --from` that may carry an environment from another stage) and `message`. An empty list means every line was read or can't install any; a script should treat a
+non-empty one as "this answer is not the whole image". Each such line comes after the last install wheelgap read: one
+before it is an error instead. With `--dockerfile-inputs`, `summary.complete` says the same as a boolean: `false`
+when `dockerfile_warnings` lists a line or `-p` and `-t` stood in for an image wheelgap couldn't read (the headline then says so too), `true` otherwise (absent without the flag). The exit code doesn't
+change for a warning.
 
 `results`, `rejected` and `via` are all keyed by target label: just the platform (`"linux-x86_64"`) when one Python is
 checked, or Python and platform (`"3.13 linux-x86_64"`) with several. The top-level `targets` list gives each target's
@@ -575,6 +601,10 @@ report, alongside whatever output mode you use. It has one testsuite per target 
 </testsuites>
 ```
 
+**After 0.13.0**, with `--dockerfile-inputs`, each line wheelgap couldn't see into ([`dockerfile_warnings`](#json)) is
+also a `<property name="wheelgap.dockerfile-warning" value="Dockerfile:8: …"/>` and a `system-out` line in every
+testsuite: it fails nothing, but the dashboard shows it.
+
 - A cell that fails the run is a failure: `missing`, `unknown`, and `source` unless `--fail-on missing`.
 - A transitive gap's failure or advisory-skip message names the direct dependency that pulls it
   in on that target, as the tables do: `source (via mcp)`, or `source (via mcp +2)`, and the element's text lists
@@ -608,6 +638,10 @@ another SARIF viewer), alongside whatever output mode you use. It has two rules,
   current directory), as for [`--github-annotations`](cli.md#github-annotations), or the file's first line when
   wheelgap can't tell the line (`pyproject.toml`, say). A package named on the command line, or read from a file
   outside the repository, has no location: its gap still fails the job, but code scanning doesn't show it.
+- **After 0.13.0**, with `--dockerfile`, a note that the final image wasn't read ([`dockerfile_notes`](#json) of kind
+  `image-not-read` or `image-libc`) is a `note` result of a third rule, `wheelgap/dockerfile-note`, at the `FROM`
+  line. The rule is listed only in a run that has such a result. A line `--dockerfile-inputs` couldn't see into
+  ([`dockerfile_warnings`](#json)) is a `warning` result of `wheelgap/dockerfile-unseen` at that line.
 - `partialFingerprints` key a result by file, package and target, not version, so code scanning keeps one alert open
   across lockfile bumps until the gap goes away. A package that one file locks at several versions gets an alert per
   version.

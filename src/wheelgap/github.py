@@ -227,10 +227,9 @@ def _requirement_lines(
             continue  # other options and editables: never a package with a gap
         if constraint or line.startswith(("-", ".", "/")):
             continue  # options, constraints, editables and paths: never a package with a gap
-        tokens = line.split()
-        line = " ".join(
-            t for k, t in enumerate(tokens) if not t.startswith("--hash") and (k == 0 or tokens[k - 1] != "--hash")
-        )
+        # The requirement ends before the first word that starts with "-", as the parser ends it (--hash, -f URL).
+        words = line.split(" ")
+        line = " ".join(words[: next((k for k, word in enumerate(words) if word.startswith("-")), len(words))]).strip()
         if "://" in line and not _NAMED_URL_RE.match(line):
             continue
         try:

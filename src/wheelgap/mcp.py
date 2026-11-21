@@ -371,7 +371,11 @@ TOOLS: list[dict[str, Any]] = [
             "Dockerfile's final stage installs with RUN pip install -r FILE instead of a lockfile (so: will this "
             "image build without compiling anything?); 'path' is then the build context, and notes name each file "
             "read and its line. Only a strict subset of Dockerfiles is read that way: a line that may install "
-            "anything else is a tool error naming the line, never a guess. " + _FIX_HELP + _STATUS_HELP
+            "anything else is a tool error naming the line, never a guess. A line wheelgap can't see into (a script, "
+            "make) after the last install it reads is listed in 'dockerfile_warnings', with summary.complete false: "
+            "the packages it installs are not in the answer, so say so rather than calling the image fine. "
+            + _FIX_HELP
+            + _STATUS_HELP
         ),
         "inputSchema": {
             "type": "object",
@@ -932,6 +936,8 @@ def _diff_lockfiles(args: dict[str, Any]) -> dict[str, Any]:
         targets = make_targets(_pythons(args) or None, _platforms(args) or None, **_versions(args))
     except TargetError as e:
         raise ToolError(str(e)) from e
+    if not _platforms(args):  # as `wheelgap diff`: without the default platforms both locks leave out
+        targets = diff.lock_default_targets(paths, targets)[0]
     sides = []
     for path in paths:
         try:

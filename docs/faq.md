@@ -14,8 +14,7 @@ Run the same command with `--explain`: it lists every wheel the target rejected 
 - **A different Python.** Wheels are built per Python version, and free-threaded Python (`3.14t`) can't use `abi3`
   wheels, so a package with only `abi3` wheels builds from source there.
 - **Your lockfile is older than the wheels.** Lockfiles record the files that existed when you locked. If the project
-  uploaded wheels for that version later, `--online` re-checks the lockfile against PyPI. A `uv.lock` made with
-  `environments` restrictions also leaves out wheels for other platforms; `--online` helps there too.
+  uploaded wheels for that version later, `--online` re-checks the lockfile against PyPI.
 - **A different version.** For a version range or a bare name, wheelgap picks the newest matching release (see
   [Version ranges](how-it-works.md#version-ranges)), which may have no wheel where an older one does. Pin the version
   you install.

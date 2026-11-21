@@ -558,6 +558,24 @@ def test_check_lockfile_offline_uses_locked_files(fake_pypi, fixtures):
     assert not fake_pypi
 
 
+def test_check_lockfile_refuses_targets_outside_the_lock_environments(fake_pypi, fixtures):
+    # tests/fixtures/uvenvironments is what uv 0.13.1 locks for environments = [Linux on x86_64]: it has no
+    # colorama (a Windows-only dependency) and none of markupsafe's Windows or macOS wheels.
+    linux = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")
+    (result,) = wheelgap.check_lockfile(fixtures / "uvenvironments", linux)
+    assert (result.name, result.statuses) == ("markupsafe", {linux[0]: Status.WHEEL})
+    assert not fake_pypi
+    (result,) = wheelgap.check_lockfile(fixtures / "uvenvironments")  # no targets: the default ones it covers
+    assert {t.platform for t in result.statuses} == {"linux-x86_64"}
+    # The default Python is the running one; below the lock's requires-python (>=3.12) it is rechecked on PyPI.
+    fake_pypi.clear()
+    for platforms in ("win-amd64", ["linux-x86_64", "linux-aarch64"], None):  # None: the default platforms
+        targets = wheelgap.make_targets(python="3.13", platforms=platforms)
+        with pytest.raises(SourceError, match="uv.lock: this lock doesn't cover .*`uv sync` fails there"):
+            wheelgap.check_lockfile(fixtures / "uvenvironments", targets, online=platforms is None)
+    assert not fake_pypi
+
+
 def test_check_lockfile_offline_skips_other_python_recheck(fake_pypi, tmp_path):
     (tmp_path / "uv.lock").write_text(LOCK_312_ONLY, encoding="utf-8")
     targets = wheelgap.make_targets(python="3.13", platforms="linux-x86_64")

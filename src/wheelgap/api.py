@@ -25,7 +25,17 @@ from typing import ClassVar, Literal, overload
 from packaging.utils import canonicalize_name
 
 from . import origin, pypi
-from .check import Row, Status, check, explain, explain_lines, status_for, wheel_tags
+from .check import (
+    Row,
+    Status,
+    check,
+    check_lock_environments,
+    explain,
+    explain_lines,
+    narrow_to_lock_environments,
+    status_for,
+    wheel_tags,
+)
 from .deps import Resolver, pinned_complete, resolve_deps
 from .offline import require_offline
 from .pyodide import PyodideLock, bundled_version_differs, bundles, check_locks
@@ -450,6 +460,8 @@ def check_lockfile(
     lockfile read. Naming one for any other lockfile raises SourceError.
     A pip installation report (`pip install --dry-run --report`) is resolved for one environment, so it raises
     SourceError unless every target matches that environment's platform, machine, Python and implementation.
+    A uv.lock made with `[tool.uv] environments` is locked for those environments only (`uv sync` fails anywhere
+    else, and the lock leaves out what other platforms need), so it raises SourceError unless every target is in them.
     extras, all_extras, groups, only_groups and no_dev select the same install as the CLI's corresponding flags.
     With no selectors, lockfiles keep the conservative all-extras/all-groups check. An explicit empty extras or
     groups iterable selects the install with no extras and the installer's default groups. pyproject.toml with
@@ -491,6 +503,7 @@ def _check_lockfile(
     no_dev: bool = False,
 ) -> tuple[list[Result], Source, list[Row]]:
     """check_lockfile(), also returning the source and check rows for diff's skips and suggestions."""
+    default_targets = targets is None
     targets = _package_targets(targets)
     pyodide_locks = tuple(pyodide_locks)
     if online and offline:
@@ -597,6 +610,9 @@ def _check_lockfile(
             resolve_deps(source, targets, resolver)
     else:
         check_report_targets(source, targets)
+        if default_targets:  # as on the command line: the default platforms the lock covers
+            targets = narrow_to_lock_environments([source], targets)[0]
+        check_lock_environments(source, targets)
         if offline:
             require_offline([source], "offline=True", undo="set offline=False")
 

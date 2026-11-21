@@ -44,10 +44,10 @@ from packaging.utils import InvalidName, canonicalize_name
 
 from . import __version__, origin, suggest
 from .api import Result, _check_lockfile, check_packages, make_targets, running_python
-from .check import CELL, Row, Status, applies, reachable
+from .check import CELL, Row, Status, applies, lock_environments_note, narrow_to_lock_environments, reachable
 from .cli import find_pyproject, libc_versions, load_config, load_uv_targets, project_dir, read_python_version
 from .logsafe import guarded_output
-from .sources import Source, SourceError
+from .sources import Source, SourceError, file_kind, find_lockfile, parse_uv_lock
 from .targets import (
     DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
@@ -414,6 +414,23 @@ def main(argv: list[str] | None = None, prog: str = "python -m wheelgap.diff") -
         return _main(argv, prog)
 
 
+def lock_default_targets(paths: list[Path], targets: list[Target]) -> tuple[list[Target], str | None]:
+    """The default targets without the platforms both sides' uv.lock `[tool.uv] environments` leave out (a platform
+    only one side leaves out stays, and is refused), with the note to print. A side that isn't a uv.lock leaves out
+    nothing, so then nothing goes; a file that can't be read here is left for the check to report."""
+    sources = []
+    for path in paths:
+        try:
+            lock = find_lockfile(path) if path.is_dir() else path
+            if file_kind(lock) != "uv" or not lock.is_file():
+                return targets, None
+            sources.append(parse_uv_lock(lock))
+        except (OSError, ValueError):
+            return targets, None
+    narrowed, left_out = narrow_to_lock_environments(sources, targets, every=True)
+    return narrowed, lock_environments_note(sources, left_out, narrowed, "default targets") if left_out else None
+
+
 def _main(argv: list[str] | None, prog: str) -> int:
     p = argparse.ArgumentParser(prog=prog, description=__doc__.splitlines()[0])
     p.add_argument(
@@ -513,10 +530,15 @@ def _main(argv: list[str] | None, prog: str) -> int:
                 sources.append(Source("api", pypi_only=True))
         else:
             with tempfile.TemporaryDirectory(prefix="wheelgap-diff-") as tmp:
+                read = []
                 for path in (args.old, args.new):
                     ref = git_ref_input(path)
-                    if ref is not None:
-                        path = read_git_ref(*ref, Path(tmp))
+                    read.append((read_git_ref(*ref, Path(tmp)) if ref is not None else path, ref))
+                if not platforms:
+                    targets, narrowed = lock_default_targets([Path(path) for path, _ in read], targets)
+                    if narrowed is not None:
+                        print(f"wheelgap: note: {narrowed}", file=sys.stderr)
+                for path, ref in read:
                     results, source, rows = _check_lockfile(path, targets, online=False, offline=False)
                     if ref is not None:
                         # An omitted parent or pdm.toml may name an index, so don't assume PyPI provenance.
