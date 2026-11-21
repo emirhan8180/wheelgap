@@ -1536,6 +1536,10 @@ def test_cli_dockerfile_inputs_follows_nested_requirements_and_constraints(tmp_p
     assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
     result = capsys.readouterr()
     assert json.loads(result.out)["packages"] == regular["packages"]
+    # A -c inside the requirements file is one of its includes, at any depth, not a -c of the RUN line.
+    [dockerfile_input] = json.loads(result.out)["dockerfile_inputs"]
+    assert dockerfile_input["constraints"] == []
+    assert sorted(dockerfile_input["includes"]) == ["base.txt", "constraints.txt", "prod.txt"]
     assert f"{path}:4: RUN pip install -r reads " in result.err
     for name in ("requirements.txt", "base.txt", "prod.txt", "constraints.txt"):
         assert str(tmp_path / name) in result.err
@@ -3471,7 +3475,9 @@ def test_cli_dockerfile_inputs_checks_the_names_an_install_line_names(tmp_path, 
         ("unpinned", "4.2"),
     ]
     assert data["sources"] == ["requirements.txt", f"{path}:3", f"{path}:8"]
-    assert data["dockerfile_inputs"] == [{"dockerfile": str(path), "line": 6, "file": "requirements.txt"}]
+    assert data["dockerfile_inputs"] == [
+        {"dockerfile": str(path), "line": 6, "file": "requirements.txt", "constraints": [], "includes": []}
+    ]
     assert data["dockerfile_packages"] == [
         {"dockerfile": str(path), "line": 3, "installer": "pip", "requirements": ["nowheels==0.9", "purewheel"]},
         {"dockerfile": str(path), "line": 8, "installer": "uv pip", "requirements": ["fastlib==2.0.0"]},
@@ -3656,7 +3662,9 @@ def test_cli_dockerfile_inputs_reads_a_multi_stage_dockerfile(tmp_path, capsys, 
     captured = capsys.readouterr()
     data = json.loads(captured.out)
     assert [p["name"] for p in data["packages"]] == ["purewheel"]
-    assert data["dockerfile_inputs"] == [{"dockerfile": str(path), "line": 8, "file": "requirements.txt"}]
+    assert data["dockerfile_inputs"] == [
+        {"dockerfile": str(path), "line": 8, "file": "requirements.txt", "constraints": [], "includes": []}
+    ]
     warnings = [(w["line"], w["kind"]) for w in data["dockerfile_warnings"]]
     assert warnings == [(9, "may-bring"), (10, "may-bring"), (11, "may-install")]
     assert "COPY --from=builder /usr/local/lib/python3.12/dist-packages" in data["dockerfile_warnings"][0]["message"]

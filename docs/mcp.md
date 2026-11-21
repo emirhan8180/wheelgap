@@ -208,7 +208,8 @@ leaving the argument out. Other inputs (requirements files, `Pipfile.lock`, `pyl
 With `inputs: true` the tool answers "will this image build without compiling anything?" in one call, as
 `wheelgap --dockerfile DOCKERFILE --dockerfile-inputs --json` does: it checks the requirements files the final
 stage installs, on the image's Python and platform. `path` in the result is then the build context, and `notes`
-names each file read and its line (`Dockerfile:4: RUN pip install -r reads requirements.txt`). Only a
+names each file read and its line (`Dockerfile:4: RUN pip install -r reads requirements.txt`). Each `dockerfile_inputs` entry
+also lists its `constraints` (`-c` files) and `includes` (the files it includes with `-r` or `-c`). Only a
 [strict subset of Dockerfiles](cli.md#dockerfile-inputs) is read this way. A line that may install anything else
 (`RUN pip install .`, say) is a tool error naming the line, never a guess. `inputs` with `path`, and `context`
 without `inputs`, are tool errors.

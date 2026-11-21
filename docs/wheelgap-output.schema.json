@@ -31,16 +31,16 @@
                         "type": "string",
                         "description": "The requirements file, relative to the build context, with / separators."
                     },
-		    "constraints": {
-			"type": "array",
-			"description": "Files after -c",
-			"items": {"type": "string"}
-		    },
-		    "includes": {
-			    "type": "array",
-			    "description": "Files after -r",
-			    "items": {"type": "string"}
-		    }
+                    "constraints": {
+                        "type": "array",
+                        "description": "The -c files of the file's RUN line, relative to the build context, with / separators.",
+                        "items": {"type": "string"}
+                    },
+                    "includes": {
+                        "type": "array",
+                        "description": "The files the requirements file includes with -r or -c, at any depth, relative to the build context, with / separators.",
+                        "items": {"type": "string"}
+                    }
                 }
             }
         },
