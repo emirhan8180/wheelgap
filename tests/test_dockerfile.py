@@ -1560,6 +1560,23 @@ def test_cli_dockerfile_inputs_has_constraints_and_includes_files(tmp_path, caps
     assert dockerfile_input["includes"] == ["reqs/base.txt"]
 
 
+def test_cli_dockerfile_inputs_includes_leave_out_a_constraints_files_own_includes(tmp_path, capsys, fake_pypi):
+    # A -r inside a -c file of the RUN line is read, and listed in the note, but isn't one of the install line's
+    # includes: those are the files the requirements file itself reaches.
+    path = _context(
+        tmp_path,
+        "FROM python:3.13-slim\nWORKDIR /app\nCOPY . .\nRUN pip install -r requirements.txt -c constraints.txt\n",
+        ("requirements.txt", "constraints.txt", "more.txt"),
+    )
+    (tmp_path / "constraints.txt").write_text("-r more.txt\n", encoding="utf-8")
+    assert main(["--dockerfile", str(path), "--dockerfile-inputs", "--json"]) == 0
+    result = capsys.readouterr()
+    [dockerfile_input] = json.loads(result.out)["dockerfile_inputs"]
+    assert dockerfile_input["constraints"] == ["constraints.txt"]
+    assert dockerfile_input["includes"] == []
+    assert str(tmp_path / "more.txt") in result.err
+
+
 @pytest.mark.parametrize(
     "flags",
     [
